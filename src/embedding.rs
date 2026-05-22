@@ -32,6 +32,10 @@ fn default_pool_size() -> usize {
         .unwrap_or(2)
 }
 
+fn next_index(counter: &AtomicUsize, len: usize) -> usize {
+    counter.fetch_add(1, Ordering::Relaxed) % len
+}
+
 impl EmbeddingConfig {
     pub fn from_env() -> Self {
         let model = std::env::var("EMBEDDING_DEFAULT_MODEL")
@@ -279,7 +283,7 @@ impl EmbeddingClient {
 
     /// Round-robin acquire a model instance from the pool.
     fn acquire(&self) -> Arc<Mutex<TextEmbedding>> {
-        let idx = self.next.fetch_add(1, Ordering::Relaxed) % self.pool.len();
+        let idx = next_index(&self.next, self.pool.len());
         self.pool[idx].clone()
     }
 
@@ -308,5 +312,222 @@ impl EmbeddingClient {
         let budget_mb = available_mb / 2;
         let max_batch = if gpu { 256 } else { 16 };
         (budget_mb / mb_per_text).clamp(4, max_batch) as usize
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    const ENV_KEYS: [&str; 3] = [
+        "EMBEDDING_DEFAULT_MODEL",
+        "EMBEDDING_CACHE_DIR",
+        "EMBEDDING_POOL_SIZE",
+    ];
+
+    /// Holds the env mutex and restores the original values on drop. Tests that
+    /// touch `std::env` must hold one of these — env state is process-global, so
+    /// parallel cargo-test threads would otherwise stomp each other.
+    struct EnvGuard {
+        saved: Vec<(&'static str, Option<String>)>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in &self.saved {
+                unsafe {
+                    match v {
+                        Some(val) => std::env::set_var(k, val),
+                        None => std::env::remove_var(k),
+                    }
+                }
+            }
+        }
+    }
+
+    fn isolate_env() -> EnvGuard {
+        let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved: Vec<(&'static str, Option<String>)> = ENV_KEYS
+            .iter()
+            .map(|k| (*k, std::env::var(k).ok()))
+            .collect();
+        for k in ENV_KEYS {
+            unsafe {
+                std::env::remove_var(k);
+            }
+        }
+        EnvGuard { saved, _lock: lock }
+    }
+
+    fn set(k: &str, v: &str) {
+        unsafe {
+            std::env::set_var(k, v);
+        }
+    }
+
+    #[test]
+    fn from_env_uses_nomic_when_unset() {
+        let _g = isolate_env();
+        let cfg = EmbeddingConfig::from_env();
+        assert!(matches!(cfg.model, EmbeddingModel::NomicEmbedTextV15));
+        assert_eq!(cfg.cache_dir, None);
+        assert!(cfg.pool_size >= 1);
+        assert!(cfg.show_download_progress);
+        assert!(cfg.execution_providers.is_empty());
+        assert_eq!(cfg.sub_batch_size, 0);
+    }
+
+    #[test]
+    fn from_env_parses_gemma_alias() {
+        let _g = isolate_env();
+        set("EMBEDDING_DEFAULT_MODEL", "embedding-gemma");
+        let cfg = EmbeddingConfig::from_env();
+        assert!(matches!(cfg.model, EmbeddingModel::EmbeddingGemma300M));
+    }
+
+    #[test]
+    fn from_env_parses_nomic_aliases() {
+        for alias in ["nomic-embed-text", "nomic", "NOMIC"] {
+            let _g = isolate_env();
+            set("EMBEDDING_DEFAULT_MODEL", alias);
+            let cfg = EmbeddingConfig::from_env();
+            assert!(
+                matches!(cfg.model, EmbeddingModel::NomicEmbedTextV15),
+                "alias `{}` should map to nomic",
+                alias
+            );
+        }
+    }
+
+    #[test]
+    fn from_env_parses_minilm_aliases() {
+        for alias in ["all-minilm", "minilm", "MiniLM"] {
+            let _g = isolate_env();
+            set("EMBEDDING_DEFAULT_MODEL", alias);
+            let cfg = EmbeddingConfig::from_env();
+            assert!(
+                matches!(cfg.model, EmbeddingModel::AllMiniLML6V2),
+                "alias `{}` should map to minilm",
+                alias
+            );
+        }
+    }
+
+    #[test]
+    fn from_env_parses_bge_aliases() {
+        for alias in ["bge-small", "bge", "BGE"] {
+            let _g = isolate_env();
+            set("EMBEDDING_DEFAULT_MODEL", alias);
+            let cfg = EmbeddingConfig::from_env();
+            assert!(
+                matches!(cfg.model, EmbeddingModel::BGESmallENV15),
+                "alias `{}` should map to bge",
+                alias
+            );
+        }
+    }
+
+    #[test]
+    fn from_env_unknown_model_falls_back_to_nomic() {
+        let _g = isolate_env();
+        set("EMBEDDING_DEFAULT_MODEL", "completely-made-up");
+        let cfg = EmbeddingConfig::from_env();
+        assert!(matches!(cfg.model, EmbeddingModel::NomicEmbedTextV15));
+    }
+
+    #[test]
+    fn from_env_reads_cache_dir() {
+        let _g = isolate_env();
+        set("EMBEDDING_CACHE_DIR", "/tmp/embedding-cache");
+        let cfg = EmbeddingConfig::from_env();
+        assert_eq!(cfg.cache_dir.as_deref(), Some("/tmp/embedding-cache"));
+    }
+
+    #[test]
+    fn from_env_parses_pool_size() {
+        let _g = isolate_env();
+        set("EMBEDDING_POOL_SIZE", "7");
+        let cfg = EmbeddingConfig::from_env();
+        assert_eq!(cfg.pool_size, 7);
+    }
+
+    #[test]
+    fn from_env_rejects_zero_pool_size() {
+        let _g = isolate_env();
+        set("EMBEDDING_POOL_SIZE", "0");
+        let cfg = EmbeddingConfig::from_env();
+        assert_eq!(cfg.pool_size, default_pool_size());
+    }
+
+    #[test]
+    fn from_env_rejects_non_numeric_pool_size() {
+        let _g = isolate_env();
+        set("EMBEDDING_POOL_SIZE", "not-a-number");
+        let cfg = EmbeddingConfig::from_env();
+        assert_eq!(cfg.pool_size, default_pool_size());
+    }
+
+    #[test]
+    fn compute_sub_batch_cpu_768_within_clamp() {
+        let result = EmbeddingClient::compute_sub_batch(768, false);
+        // 32 is the sysinfo-zero fallback; otherwise the CPU clamp is [4, 16].
+        assert!(
+            result == 32 || (4..=16).contains(&result),
+            "got {} for cpu/768",
+            result
+        );
+    }
+
+    #[test]
+    fn compute_sub_batch_cpu_384_within_clamp() {
+        let result = EmbeddingClient::compute_sub_batch(384, false);
+        assert!(
+            result == 32 || (4..=16).contains(&result),
+            "got {} for cpu/384",
+            result
+        );
+    }
+
+    #[test]
+    fn compute_sub_batch_gpu_raises_ceiling() {
+        let result = EmbeddingClient::compute_sub_batch(768, true);
+        assert!(
+            result == 32 || (4..=256).contains(&result),
+            "got {} for gpu/768",
+            result
+        );
+    }
+
+    #[test]
+    fn next_index_round_robins_through_pool() {
+        let counter = AtomicUsize::new(0);
+        let observed: Vec<usize> = (0..7).map(|_| next_index(&counter, 3)).collect();
+        assert_eq!(observed, vec![0, 1, 2, 0, 1, 2, 0]);
+    }
+
+    #[test]
+    fn next_index_pool_of_one_always_zero() {
+        let counter = AtomicUsize::new(0);
+        for _ in 0..5 {
+            assert_eq!(next_index(&counter, 1), 0);
+        }
+    }
+
+    #[test]
+    fn next_index_continues_from_existing_counter_value() {
+        let counter = AtomicUsize::new(5);
+        // 5 % 3 = 2, then 6 % 3 = 0, then 7 % 3 = 1
+        assert_eq!(next_index(&counter, 3), 2);
+        assert_eq!(next_index(&counter, 3), 0);
+        assert_eq!(next_index(&counter, 3), 1);
+    }
+
+    #[test]
+    fn default_pool_size_is_positive() {
+        assert!(default_pool_size() >= 1);
     }
 }

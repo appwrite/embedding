@@ -9,9 +9,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::embedding::{EmbeddingClient, EmbeddingConfig};
-
-mod embedding;
+use embedding::{EmbeddingClient, EmbeddingConfig};
 
 #[derive(Clone)]
 struct AppState {
