@@ -1,6 +1,20 @@
-use fastembed::{EmbeddingModel, ExecutionProviderDispatch, InitOptions, TextEmbedding};
-use futures::lock::Mutex;
-use std::sync::{Arc, atomic::AtomicUsize};
+use fastembed::{
+    EmbeddingModel, ExecutionProviderDispatch, InitOptions, TextEmbedding, get_cache_dir,
+};
+use hf_hub::api::sync::ApiBuilder;
+use std::path::PathBuf;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
+use tokenizers::Tokenizer;
+
+#[derive(Debug, Clone)]
+pub struct EmbedOutcome {
+    pub model: String,
+    pub embeddings: Vec<Vec<f32>>,
+    pub tokens: usize,
+}
 
 #[derive(Debug, Clone)]
 pub struct EmbeddingConfig {
@@ -55,6 +69,7 @@ pub struct EmbeddingClient {
     next: AtomicUsize,
     dimension: usize,
     model_name: String,
+    tokenizer: Arc<Tokenizer>,
     sub_batch_override: usize,
     gpu: bool,
 }
@@ -97,6 +112,10 @@ impl EmbeddingClient {
         let has_gpu_providers = !config.execution_providers.is_empty();
 
         let mut first_model = Self::init_model(&config)?;
+
+        // Tokenizer is fetched from the same cache dir fastembed just populated,
+        // so this is a cache hit (no network) after the first model load.
+        let tokenizer = Arc::new(Self::load_tokenizer(&config)?);
 
         // Run a warmup inference so the ONNX Runtime arena is allocated before
         // we measure memory.  Without this, per_instance only captures model
@@ -143,7 +162,7 @@ impl EmbeddingClient {
         pool.push(Arc::new(Mutex::new(first_model)));
 
         for _ in 1..pool_size {
-            let mut model = Self::init_model(&config)?;
+            let model = Self::init_model(&config)?;
             pool.push(Arc::new(Mutex::new(model)));
         }
 
@@ -167,9 +186,30 @@ impl EmbeddingClient {
             next: AtomicUsize::new(0),
             dimension,
             model_name,
+            tokenizer,
             sub_batch_override,
             gpu: has_gpu_providers,
         })
+    }
+
+    fn load_tokenizer(config: &EmbeddingConfig) -> Result<Tokenizer, String> {
+        let info = TextEmbedding::get_model_info(&config.model)
+            .map_err(|e| format!("get_model_info: {}", e))?;
+        let cache_dir: PathBuf = config
+            .cache_dir
+            .clone()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| get_cache_dir().into());
+        let api = ApiBuilder::new()
+            .with_cache_dir(cache_dir)
+            .with_progress(false)
+            .build()
+            .map_err(|e| format!("hf-hub init: {}", e))?;
+        let repo = api.model(info.model_code.clone());
+        let path = repo
+            .get("tokenizer.json")
+            .map_err(|e| format!("fetch tokenizer.json: {}", e))?;
+        Tokenizer::from_file(&path).map_err(|e| format!("parse tokenizer.json: {}", e))
     }
 
     fn init_model(config: &EmbeddingConfig) -> Result<TextEmbedding, String> {
@@ -187,5 +227,86 @@ impl EmbeddingClient {
 
         Ok(TextEmbedding::try_new(init_options)
             .map_err(|e| format!("Failed to initialize embedding model: {}", e.to_string()))?)
+    }
+    pub async fn embed(&self, texts: &[&str]) -> Result<EmbedOutcome, String> {
+        let sub_batch = if self.sub_batch_override > 0 {
+            self.sub_batch_override
+        } else {
+            Self::compute_sub_batch(self.dimension, self.gpu)
+        };
+
+        let mut handles = Vec::new();
+        for chunk in texts.chunks(sub_batch) {
+            let model = self.acquire();
+            let chunked_texts: Vec<String> = chunk.iter().map(|text| (*text).to_owned()).collect();
+
+            handles.push(tokio::task::spawn_blocking(move || {
+                let mut model = model
+                    .lock()
+                    .map_err(|e| format!("Embedding model lock poisoned: {}", e.to_string()))?;
+
+                model
+                    .embed(chunked_texts, None)
+                    .map_err(|e| format!("Failed to generate embeddings: {}", e.to_string()))
+            }));
+        }
+
+        let mut embeddings = Vec::with_capacity(texts.len());
+        for handle in handles {
+            let mut batch_result = handle
+                .await
+                .map_err(|e| format!("Failed to join embedding task: {}", e.to_string()))??;
+            embeddings.append(&mut batch_result);
+        }
+
+        let tokenizer = self.tokenizer.clone();
+        let owned_texts: Vec<String> = texts.iter().map(|t| (t).to_string()).collect();
+        let tokens = tokio::task::spawn_blocking(move || -> Result<usize, String> {
+            let encodings = tokenizer
+                .encode_batch(owned_texts, true)
+                .map_err(|e| format!("tokenize: {}", e))?;
+            Ok(encodings.iter().map(|e| e.get_ids().len()).sum())
+        })
+        .await
+        .map_err(|e| format!("Failed to join tokenizer task: {}", e.to_string()))??;
+
+        Ok(EmbedOutcome {
+            model: self.model_name.clone(),
+            embeddings,
+            tokens,
+        })
+    }
+
+    /// Round-robin acquire a model instance from the pool.
+    fn acquire(&self) -> Arc<Mutex<TextEmbedding>> {
+        let idx = self.next.fetch_add(1, Ordering::Relaxed) % self.pool.len();
+        self.pool[idx].clone()
+    }
+
+    /// Compute sub-batch size based on available system memory.
+    ///
+    /// Uses 50% of available RAM as a budget.  Falls back to 32 if sysinfo
+    /// reports 0.
+    /// When GPU is enabled, the upper clamp is raised to 256 (GPU VRAM can
+    /// handle much larger batches than CPU).
+    /// TODO: add here the config batch size
+    fn compute_sub_batch(dimension: usize, gpu: bool) -> usize {
+        let mut sys = sysinfo::System::new();
+        sys.refresh_memory();
+        let available_mb = sys.available_memory() / (1024 * 1024);
+
+        if available_mb == 0 {
+            return 32;
+        }
+
+        // Per-text memory estimate for ONNX inference.  Attention matrices
+        // dominate: heads × seq² × 4 bytes.  For 768-dim BERT-like models
+        // (12 heads) processing ~1000-2000 token code chunks, attention alone
+        // is 50-200 MB per text.  The estimate below is conservative so the
+        // sub-batch stays small enough to prevent arena over-allocation.
+        let mb_per_text: u64 = if dimension >= 768 { 100 } else { 40 };
+        let budget_mb = available_mb / 2;
+        let max_batch = if gpu { 256 } else { 16 };
+        (budget_mb / mb_per_text).clamp(4, max_batch) as usize
     }
 }
