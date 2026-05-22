@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-FROM rust:1.95-slim-bookworm AS builder
+FROM rust:1.95-slim-trixie AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
         pkg-config \
         libssl-dev \
@@ -13,10 +13,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release --bin embedding && \
     cp target/release/embedding /usr/local/bin/embedding
 
-FROM debian:bookworm-slim AS runtime
+FROM debian:trixie-slim AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
-        libssl3 \
+        libssl3t64 \
         libstdc++6 \
     && rm -rf /var/lib/apt/lists/*
 
