@@ -1,0 +1,11 @@
+[package]
+name = "embedding"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+fastembed = "5.13.4"
+futures = "0.3.32"
+sysinfo = "0.39.2"
+tokio = "1.52.3"
+tracing = "0.1.44"
