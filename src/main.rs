@@ -1,25 +1,87 @@
+use std::sync::Arc;
+
+use axum::{
+    Json, Router,
+    extract::State,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    routing::post,
+};
+use serde::{Deserialize, Serialize};
+
 use crate::embedding::{EmbeddingClient, EmbeddingConfig};
 
 mod embedding;
 
+#[derive(Clone)]
+struct AppState {
+    client: Arc<EmbeddingClient>,
+}
+
+#[derive(Deserialize)]
+struct EmbedRequest {
+    texts: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct EmbedResponse {
+    model: String,
+    embeddings: Vec<Vec<f32>>,
+    tokens: usize,
+}
+
+struct AppError(StatusCode, String);
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        (self.0, Json(serde_json::json!({ "error": self.1 }))).into_response()
+    }
+}
+
+async fn embed(
+    State(state): State<AppState>,
+    Json(req): Json<EmbedRequest>,
+) -> Result<Json<EmbedResponse>, AppError> {
+    if req.texts.is_empty() {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "texts must not be empty".to_string(),
+        ));
+    }
+
+    let refs: Vec<&str> = req.texts.iter().map(|s| s.as_str()).collect();
+    let result = state
+        .client
+        .embed(&refs)
+        .await
+        .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    Ok(Json(EmbedResponse {
+        model: result.model,
+        embeddings: result.embeddings,
+        tokens: result.tokens,
+    }))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
     let config = EmbeddingConfig::from_env();
-    let client = EmbeddingClient::new(config)?;
+    let client = Arc::new(EmbeddingClient::new(config)?);
+    let state = AppState { client };
 
-    let texts = vec!["hello world", "another piece of text"];
-    let outcome = client.embed(&texts).await?;
+    let app = Router::new().route("/embed", post(embed)).with_state(state);
 
-    for (text, embedding) in texts.iter().zip(outcome.embeddings.iter()) {
-        let preview = &embedding[..5.min(embedding.len())];
-        println!("{text:?} -> dim={} first5={preview:?}", embedding.len());
-    }
-    println!(
-        "model={} total_tokens={} batch_size={}",
-        outcome.model,
-        outcome.tokens,
-        outcome.embeddings.len()
-    );
+    let addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    tracing::info!("listening on {}", addr);
+    axum::serve(listener, app).await?;
 
     Ok(())
 }
