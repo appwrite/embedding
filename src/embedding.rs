@@ -10,7 +10,7 @@ use std::sync::{
 use tokenizers::Tokenizer;
 
 #[derive(Debug, Clone)]
-pub struct EmbedOutcome {
+pub struct EmbeddingResult {
     pub model: String,
     pub embeddings: Vec<Vec<f32>>,
     pub tokens: usize,
@@ -228,7 +228,7 @@ impl EmbeddingClient {
         Ok(TextEmbedding::try_new(init_options)
             .map_err(|e| format!("Failed to initialize embedding model: {}", e.to_string()))?)
     }
-    pub async fn embed(&self, texts: &[&str]) -> Result<EmbedOutcome, String> {
+    pub async fn embed(&self, texts: &[&str]) -> Result<EmbeddingResult, String> {
         let sub_batch = if self.sub_batch_override > 0 {
             self.sub_batch_override
         } else {
@@ -270,7 +270,7 @@ impl EmbeddingClient {
         .await
         .map_err(|e| format!("Failed to join tokenizer task: {}", e.to_string()))??;
 
-        Ok(EmbedOutcome {
+        Ok(EmbeddingResult {
             model: self.model_name.clone(),
             embeddings,
             tokens,
