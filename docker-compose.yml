@@ -1,0 +1,14 @@
+services:
+  embedding:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: embedding:latest
+    container_name: embedding
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env
+    volumes:
+      - ./models:/home/embedder/models
+    restart: unless-stopped
