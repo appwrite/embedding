@@ -140,10 +140,10 @@ impl EmbeddingClient {
 
         // determining pool size based on ram and capacity provided
         let nproc = default_pool_size();
-        let pool_size = if per_instance_bytes > 0 {
-            // 60% of memory that was available before loading first model
-            let budget = mem_before_loading_model * 6 / 10;
-            let max_memory = (budget / per_instance_bytes).max(1) as usize;
+        // 60% of memory that was available before loading first model
+        let budget = mem_before_loading_model * 6 / 10;
+        let pool_size = if let Some(max_memory) = budget.checked_div(per_instance_bytes) {
+            let max_memory = (max_memory as usize).max(1);
             let capped = max_memory.min(desired_pool_size);
             tracing::info!(
                 per_instance_mb = per_instance_loaded / (1024 * 1024),
@@ -229,8 +229,8 @@ impl EmbeddingClient {
                 init_options.with_execution_providers(config.execution_providers.clone());
         }
 
-        Ok(TextEmbedding::try_new(init_options)
-            .map_err(|e| format!("Failed to initialize embedding model: {}", e.to_string()))?)
+        TextEmbedding::try_new(init_options)
+            .map_err(|e| format!("Failed to initialize embedding model: {}", e))
     }
     pub async fn embed(&self, texts: &[&str]) -> Result<EmbeddingResult, String> {
         let sub_batch = if self.sub_batch_override > 0 {
@@ -247,11 +247,11 @@ impl EmbeddingClient {
             handles.push(tokio::task::spawn_blocking(move || {
                 let mut model = model
                     .lock()
-                    .map_err(|e| format!("Embedding model lock poisoned: {}", e.to_string()))?;
+                    .map_err(|e| format!("Embedding model lock poisoned: {}", e))?;
 
                 model
                     .embed(chunked_texts, None)
-                    .map_err(|e| format!("Failed to generate embeddings: {}", e.to_string()))
+                    .map_err(|e| format!("Failed to generate embeddings: {}", e))
             }));
         }
 
@@ -259,7 +259,7 @@ impl EmbeddingClient {
         for handle in handles {
             let mut batch_result = handle
                 .await
-                .map_err(|e| format!("Failed to join embedding task: {}", e.to_string()))??;
+                .map_err(|e| format!("Failed to join embedding task: {}", e))??;
             embeddings.append(&mut batch_result);
         }
 
@@ -272,7 +272,7 @@ impl EmbeddingClient {
             Ok(encodings.iter().map(|e| e.get_ids().len()).sum())
         })
         .await
-        .map_err(|e| format!("Failed to join tokenizer task: {}", e.to_string()))??;
+        .map_err(|e| format!("Failed to join tokenizer task: {}", e))??;
 
         Ok(EmbeddingResult {
             model: self.model_name.clone(),
