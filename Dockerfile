@@ -21,7 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 RUN useradd --create-home --uid 10001 embedder
-RUN mkdir -p /home/embedder/models && chown -R embedder:embedder /home/embedder
+RUN mkdir -p /home/embedder/models && chown embedder:embedder /home/embedder/models
 ENV EMBEDDING_CACHE_DIR=/home/embedder/models
 USER embedder
 WORKDIR /home/embedder
