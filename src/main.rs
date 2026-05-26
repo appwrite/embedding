@@ -18,6 +18,7 @@ struct AppState {
 
 #[derive(Deserialize)]
 struct EmbedRequest {
+    model: String,
     texts: Vec<String>,
 }
 
@@ -50,7 +51,7 @@ async fn embed(
     let refs: Vec<&str> = req.texts.iter().map(|s| s.as_str()).collect();
     let result = state
         .client
-        .embed(&refs)
+        .embed(&req.model, &refs)
         .await
         .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 

@@ -1,7 +1,7 @@
-use fastembed::{
-    EmbeddingModel, ExecutionProviderDispatch, InitOptions, TextEmbedding, get_cache_dir,
-};
+use crate::model::{self, EmbeddingModel};
+use fastembed::{ExecutionProviderDispatch, InitOptions, TextEmbedding, get_cache_dir};
 use hf_hub::api::sync::ApiBuilder;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{
     Arc, Mutex,
@@ -18,7 +18,7 @@ pub struct EmbeddingResult {
 
 #[derive(Debug, Clone)]
 pub struct EmbeddingConfig {
-    pub model: EmbeddingModel,
+    pub models: Vec<EmbeddingModel>,
     pub show_download_progress: bool,
     pub cache_dir: Option<String>,
     pub pool_size: usize,
@@ -38,16 +38,19 @@ fn next_index(counter: &AtomicUsize, len: usize) -> usize {
 
 impl EmbeddingConfig {
     pub fn from_env() -> Self {
-        let model = std::env::var("EMBEDDING_MODELS")
+        let models: Vec<EmbeddingModel> = std::env::var("EMBEDDING_MODELS")
             .ok()
-            .and_then(|m| match m.to_lowercase().as_str() {
-                "embedding-gemma" => Some(EmbeddingModel::EmbeddingGemma300M),
-                "nomic-embed-text" | "nomic" => Some(EmbeddingModel::NomicEmbedTextV15),
-                "all-minilm" | "minilm" => Some(EmbeddingModel::AllMiniLML6V2),
-                "bge-small" | "bge" => Some(EmbeddingModel::BGESmallENV15),
-                _ => None,
+            .map(|model| {
+                model
+                    .split(",")
+                    .map(|model| {
+                        let name = model.trim();
+                        model::from_name(name)
+                            .unwrap_or_else(|| panic!("{} model not available", name))
+                    })
+                    .collect()
             })
-            .unwrap_or(EmbeddingModel::NomicEmbedTextV15);
+            .unwrap_or_else(|| vec![EmbeddingModel::NomicEmbedTextV15]);
 
         let cache_dir = std::env::var("EMBEDDING_CACHE_DIR").ok();
 
@@ -58,7 +61,7 @@ impl EmbeddingConfig {
             .unwrap_or_else(default_pool_size);
 
         Self {
-            model,
+            models,
             show_download_progress: true,
             cache_dir,
             pool_size,
@@ -69,13 +72,17 @@ impl EmbeddingConfig {
 }
 
 pub struct EmbeddingClient {
-    pool: Vec<Arc<Mutex<TextEmbedding>>>,
-    next: AtomicUsize,
-    dimension: usize,
-    model_name: String,
-    tokenizer: Arc<Tokenizer>,
+    models: HashMap<String, LoadedModel>,
     sub_batch_override: usize,
     gpu: bool,
+}
+
+struct LoadedModel {
+    model_name: String,
+    next: AtomicUsize,
+    pool: Vec<Arc<Mutex<TextEmbedding>>>,
+    dimension: usize,
+    tokenizer: Arc<Tokenizer>,
 }
 
 impl EmbeddingClient {
@@ -94,20 +101,29 @@ impl EmbeddingClient {
         // We therefore run a warmup inference before measuring memory usage,
         // otherwise pool sizing would severely underestimate the true runtime
         // footprint and may cause OOMs under load.
+        let mut models = HashMap::new();
+        for model in &config.models {
+            let model_name = format!("{:?}", model);
+            let loaded_model = Self::load_model(model, &model_name, &config)?;
+            models.insert(model_name, loaded_model);
+        }
 
-        let dimension = match config.model {
-            EmbeddingModel::NomicEmbedTextV15 => 768,
-            EmbeddingModel::NomicEmbedTextV1 => 768,
-            EmbeddingModel::AllMiniLML6V2 => 384,
-            EmbeddingModel::BGESmallENV15 => 384,
-            EmbeddingModel::BGEBaseENV15 => 768,
-            EmbeddingModel::BGELargeENV15 => 1024,
-            _ => 768,
-        };
+        let sub_batch_override = config.sub_batch_size;
+        let gpu = !config.execution_providers.is_empty();
+        Ok(Self {
+            models,
+            sub_batch_override,
+            gpu,
+        })
+    }
 
-        let model_name = format!("{:?}", config.model);
+    fn load_model(
+        model: &EmbeddingModel,
+        model_name: &str,
+        config: &EmbeddingConfig,
+    ) -> Result<LoadedModel, String> {
         let desired_pool_size = config.pool_size.max(1);
-
+        let dimension = model::dimension(model);
         // loading instance and measuring memory footprint
         let mut sys = sysinfo::System::new();
         sys.refresh_memory();
@@ -115,11 +131,11 @@ impl EmbeddingClient {
 
         let has_gpu_providers = !config.execution_providers.is_empty();
 
-        let mut first_model = Self::init_model(&config)?;
+        let mut first_model = Self::init_model(model, config)?;
 
         // Tokenizer is fetched from the same cache dir fastembed just populated,
         // so this is a cache hit (no network) after the first model load.
-        let tokenizer = Arc::new(Self::load_tokenizer(&config)?);
+        let tokenizer = Arc::new(Self::load_tokenizer(model, config)?);
 
         // Run a warmup inference so the ONNX Runtime arena is allocated before
         // we measure memory.  Without this, per_instance only captures model
@@ -166,8 +182,8 @@ impl EmbeddingClient {
         pool.push(Arc::new(Mutex::new(first_model)));
 
         for _ in 1..pool_size {
-            let model = Self::init_model(&config)?;
-            pool.push(Arc::new(Mutex::new(model)));
+            let inst = Self::init_model(model, config)?;
+            pool.push(Arc::new(Mutex::new(inst)));
         }
 
         let ep_label = if has_gpu_providers {
@@ -183,22 +199,21 @@ impl EmbeddingClient {
             ep_label,
         );
 
-        let sub_batch_override = config.sub_batch_size;
-
-        Ok(Self {
-            pool,
-            next: AtomicUsize::new(0),
+        Ok(LoadedModel {
             dimension,
-            model_name,
+            model_name: model_name.to_string(),
+            next: AtomicUsize::new(0),
+            pool,
             tokenizer,
-            sub_batch_override,
-            gpu: has_gpu_providers,
         })
     }
 
-    fn load_tokenizer(config: &EmbeddingConfig) -> Result<Tokenizer, String> {
-        let info = TextEmbedding::get_model_info(&config.model)
-            .map_err(|e| format!("get_model_info: {}", e))?;
+    fn load_tokenizer(
+        model: &EmbeddingModel,
+        config: &EmbeddingConfig,
+    ) -> Result<Tokenizer, String> {
+        let info =
+            TextEmbedding::get_model_info(model).map_err(|e| format!("get_model_info: {}", e))?;
         let cache_dir: PathBuf = config
             .cache_dir
             .clone()
@@ -216,8 +231,11 @@ impl EmbeddingClient {
         Tokenizer::from_file(&path).map_err(|e| format!("parse tokenizer.json: {}", e))
     }
 
-    fn init_model(config: &EmbeddingConfig) -> Result<TextEmbedding, String> {
-        let mut init_options = InitOptions::new(config.model.clone())
+    fn init_model(
+        model: &EmbeddingModel,
+        config: &EmbeddingConfig,
+    ) -> Result<TextEmbedding, String> {
+        let mut init_options = InitOptions::new(model.clone())
             .with_show_download_progress(config.show_download_progress);
 
         if let Some(cache_dir) = &config.cache_dir {
@@ -232,25 +250,33 @@ impl EmbeddingClient {
         TextEmbedding::try_new(init_options)
             .map_err(|e| format!("Failed to initialize embedding model: {}", e))
     }
-    pub async fn embed(&self, texts: &[&str]) -> Result<EmbeddingResult, String> {
+    pub async fn embed(&self, model_name: &str, texts: &[&str]) -> Result<EmbeddingResult, String> {
+        // Accept any alias the user might type ("minilm", "all-minilm", "MiniLM"…)
+        // by resolving to the canonical Debug name we used as the HashMap key.
+        let resolved = model::from_name(model_name)
+            .ok_or_else(|| format!("unknown model alias: {}", model_name))?;
+        let canonical = format!("{:?}", resolved);
+        let loaded = self
+            .models
+            .get(&canonical)
+            .ok_or_else(|| format!("model not allowed: {}", model_name))?;
+
         let sub_batch = if self.sub_batch_override > 0 {
             self.sub_batch_override
         } else {
-            Self::compute_sub_batch(self.dimension, self.gpu)
+            Self::compute_sub_batch(loaded.dimension, self.gpu)
         };
 
         let mut handles = Vec::new();
         for chunk in texts.chunks(sub_batch) {
-            let model = self.acquire();
-            let chunked_texts: Vec<String> = chunk.iter().map(|text| (*text).to_owned()).collect();
+            let inst = Self::acquire(loaded);
+            let chunked_texts: Vec<String> = chunk.iter().map(|t| (*t).to_owned()).collect();
 
             handles.push(tokio::task::spawn_blocking(move || {
-                let mut model = model
+                let mut m = inst
                     .lock()
                     .map_err(|e| format!("Embedding model lock poisoned: {}", e))?;
-
-                model
-                    .embed(chunked_texts, None)
+                m.embed(chunked_texts, None)
                     .map_err(|e| format!("Failed to generate embeddings: {}", e))
             }));
         }
@@ -263,8 +289,8 @@ impl EmbeddingClient {
             embeddings.append(&mut batch_result);
         }
 
-        let tokenizer = self.tokenizer.clone();
-        let owned_texts: Vec<String> = texts.iter().map(|t| (t).to_string()).collect();
+        let tokenizer = loaded.tokenizer.clone();
+        let owned_texts: Vec<String> = texts.iter().map(|t| t.to_string()).collect();
         let tokens = tokio::task::spawn_blocking(move || -> Result<usize, String> {
             let encodings = tokenizer
                 .encode_batch(owned_texts, true)
@@ -275,16 +301,16 @@ impl EmbeddingClient {
         .map_err(|e| format!("Failed to join tokenizer task: {}", e))??;
 
         Ok(EmbeddingResult {
-            model: self.model_name.clone(),
+            model: loaded.model_name.clone(),
             embeddings,
             tokens,
         })
     }
 
-    /// Round-robin acquire a model instance from the pool.
-    fn acquire(&self) -> Arc<Mutex<TextEmbedding>> {
-        let idx = next_index(&self.next, self.pool.len());
-        self.pool[idx].clone()
+    /// Round-robin acquire one instance from a model's pool.
+    fn acquire(loaded: &LoadedModel) -> Arc<Mutex<TextEmbedding>> {
+        let idx = next_index(&loaded.next, loaded.pool.len());
+        loaded.pool[idx].clone()
     }
 
     /// Compute sub-batch size based on available system memory.
@@ -373,7 +399,7 @@ mod tests {
     fn from_env_uses_nomic_when_unset() {
         let _g = isolate_env();
         let cfg = EmbeddingConfig::from_env();
-        assert!(matches!(cfg.model, EmbeddingModel::NomicEmbedTextV15));
+        assert!(matches!(cfg.models[0], EmbeddingModel::NomicEmbedTextV15));
         assert_eq!(cfg.cache_dir, None);
         assert!(cfg.pool_size >= 1);
         assert!(cfg.show_download_progress);
@@ -386,7 +412,7 @@ mod tests {
         let _g = isolate_env();
         set("EMBEDDING_MODELS", "embedding-gemma");
         let cfg = EmbeddingConfig::from_env();
-        assert!(matches!(cfg.model, EmbeddingModel::EmbeddingGemma300M));
+        assert!(matches!(cfg.models[0], EmbeddingModel::EmbeddingGemma300M));
     }
 
     #[test]
@@ -396,7 +422,7 @@ mod tests {
             set("EMBEDDING_MODELS", alias);
             let cfg = EmbeddingConfig::from_env();
             assert!(
-                matches!(cfg.model, EmbeddingModel::NomicEmbedTextV15),
+                matches!(cfg.models[0], EmbeddingModel::NomicEmbedTextV15),
                 "alias `{}` should map to nomic",
                 alias
             );
@@ -410,7 +436,7 @@ mod tests {
             set("EMBEDDING_MODELS", alias);
             let cfg = EmbeddingConfig::from_env();
             assert!(
-                matches!(cfg.model, EmbeddingModel::AllMiniLML6V2),
+                matches!(cfg.models[0], EmbeddingModel::AllMiniLML6V2),
                 "alias `{}` should map to minilm",
                 alias
             );
@@ -424,7 +450,7 @@ mod tests {
             set("EMBEDDING_MODELS", alias);
             let cfg = EmbeddingConfig::from_env();
             assert!(
-                matches!(cfg.model, EmbeddingModel::BGESmallENV15),
+                matches!(cfg.models[0], EmbeddingModel::BGESmallENV15),
                 "alias `{}` should map to bge",
                 alias
             );
@@ -432,11 +458,26 @@ mod tests {
     }
 
     #[test]
-    fn from_env_unknown_model_falls_back_to_nomic() {
+    #[should_panic(expected = "model not available")]
+    fn from_env_unknown_model_panics() {
         let _g = isolate_env();
         set("EMBEDDING_MODELS", "completely-made-up");
+        let _ = EmbeddingConfig::from_env();
+    }
+
+    #[test]
+    fn from_env_parses_comma_separated_list() {
+        let _g = isolate_env();
+        set("EMBEDDING_MODELS", "nomic, minilm , bge");
         let cfg = EmbeddingConfig::from_env();
-        assert!(matches!(cfg.model, EmbeddingModel::NomicEmbedTextV15));
+        assert_eq!(
+            cfg.models,
+            vec![
+                EmbeddingModel::NomicEmbedTextV15,
+                EmbeddingModel::AllMiniLML6V2,
+                EmbeddingModel::BGESmallENV15,
+            ]
+        );
     }
 
     #[test]
