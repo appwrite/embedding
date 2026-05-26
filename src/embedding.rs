@@ -38,7 +38,7 @@ fn next_index(counter: &AtomicUsize, len: usize) -> usize {
 
 impl EmbeddingConfig {
     pub fn from_env() -> Self {
-        let model = std::env::var("EMBEDDING_DEFAULT_MODEL")
+        let model = std::env::var("EMBEDDING_MODELS")
             .ok()
             .and_then(|m| match m.to_lowercase().as_str() {
                 "embedding-gemma" => Some(EmbeddingModel::EmbeddingGemma300M),
@@ -323,7 +323,7 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     const ENV_KEYS: [&str; 3] = [
-        "EMBEDDING_DEFAULT_MODEL",
+        "EMBEDDING_MODELS",
         "EMBEDDING_CACHE_DIR",
         "EMBEDDING_POOL_SIZE",
     ];
@@ -384,7 +384,7 @@ mod tests {
     #[test]
     fn from_env_parses_gemma_alias() {
         let _g = isolate_env();
-        set("EMBEDDING_DEFAULT_MODEL", "embedding-gemma");
+        set("EMBEDDING_MODELS", "embedding-gemma");
         let cfg = EmbeddingConfig::from_env();
         assert!(matches!(cfg.model, EmbeddingModel::EmbeddingGemma300M));
     }
@@ -393,7 +393,7 @@ mod tests {
     fn from_env_parses_nomic_aliases() {
         for alias in ["nomic-embed-text", "nomic", "NOMIC"] {
             let _g = isolate_env();
-            set("EMBEDDING_DEFAULT_MODEL", alias);
+            set("EMBEDDING_MODELS", alias);
             let cfg = EmbeddingConfig::from_env();
             assert!(
                 matches!(cfg.model, EmbeddingModel::NomicEmbedTextV15),
@@ -407,7 +407,7 @@ mod tests {
     fn from_env_parses_minilm_aliases() {
         for alias in ["all-minilm", "minilm", "MiniLM"] {
             let _g = isolate_env();
-            set("EMBEDDING_DEFAULT_MODEL", alias);
+            set("EMBEDDING_MODELS", alias);
             let cfg = EmbeddingConfig::from_env();
             assert!(
                 matches!(cfg.model, EmbeddingModel::AllMiniLML6V2),
@@ -421,7 +421,7 @@ mod tests {
     fn from_env_parses_bge_aliases() {
         for alias in ["bge-small", "bge", "BGE"] {
             let _g = isolate_env();
-            set("EMBEDDING_DEFAULT_MODEL", alias);
+            set("EMBEDDING_MODELS", alias);
             let cfg = EmbeddingConfig::from_env();
             assert!(
                 matches!(cfg.model, EmbeddingModel::BGESmallENV15),
@@ -434,7 +434,7 @@ mod tests {
     #[test]
     fn from_env_unknown_model_falls_back_to_nomic() {
         let _g = isolate_env();
-        set("EMBEDDING_DEFAULT_MODEL", "completely-made-up");
+        set("EMBEDDING_MODELS", "completely-made-up");
         let cfg = EmbeddingConfig::from_env();
         assert!(matches!(cfg.model, EmbeddingModel::NomicEmbedTextV15));
     }
