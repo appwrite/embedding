@@ -27,6 +27,7 @@ struct EmbedResponse {
     model: String,
     embeddings: Vec<Vec<f32>>,
     tokens: usize,
+    total_duration: u64,
 }
 
 struct AppError(StatusCode, String);
@@ -59,6 +60,7 @@ async fn embed(
         model: result.model,
         embeddings: result.embeddings,
         tokens: result.tokens,
+        total_duration: result.total_duration,
     }))
 }
 

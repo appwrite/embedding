@@ -14,6 +14,7 @@ pub struct EmbeddingResult {
     pub model: String,
     pub embeddings: Vec<Vec<f32>>,
     pub tokens: usize,
+    pub total_duration: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -251,6 +252,7 @@ impl EmbeddingClient {
             .map_err(|e| format!("Failed to initialize embedding model: {}", e))
     }
     pub async fn embed(&self, model_name: &str, texts: &[&str]) -> Result<EmbeddingResult, String> {
+        let started = std::time::Instant::now();
         // Accept any alias the user might type ("minilm", "all-minilm", "MiniLM"…)
         // by resolving to the canonical Debug name we used as the HashMap key.
         let resolved = model::from_name(model_name)
@@ -304,6 +306,7 @@ impl EmbeddingClient {
             model: loaded.model_name.clone(),
             embeddings,
             tokens,
+            total_duration: started.elapsed().as_nanos() as u64,
         })
     }
 
