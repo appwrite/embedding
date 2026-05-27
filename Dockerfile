@@ -10,8 +10,9 @@ WORKDIR /app
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
-    cargo build --release --bin embedding && \
-    cp target/release/embedding /usr/local/bin/embedding
+    cargo build --release --bin embedding --bin warmup && \
+    cp target/release/embedding /usr/local/bin/embedding && \
+    cp target/release/warmup /usr/local/bin/warmup
 
 FROM debian:trixie-slim AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -27,6 +28,14 @@ USER embedder
 WORKDIR /home/embedder
 
 COPY --from=builder /usr/local/bin/embedding /usr/local/bin/embedding
+COPY --from=builder /usr/local/bin/warmup /usr/local/bin/warmup
+
+# Download models at build time so the image ships with them cached. Override
+# the model set with `--build-arg EMBEDDING_MODELS=...` (docker compose passes
+# this from .env). Pool size is forced to 1 to keep the build's memory low —
+# it only affects the warmup, not the runtime pool.
+ARG EMBEDDING_MODELS=nomic,bge-small
+RUN EMBEDDING_MODELS="${EMBEDDING_MODELS}" EMBEDDING_POOL_SIZE=1 /usr/local/bin/warmup
 
 EXPOSE 3000
 

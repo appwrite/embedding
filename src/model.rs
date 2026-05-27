@@ -18,6 +18,7 @@ pub fn dimension(model: &EmbeddingModel) -> usize {
         EmbeddingModel::BGESmallENV15 => 384,
         EmbeddingModel::BGEBaseENV15 => 768,
         EmbeddingModel::BGELargeENV15 => 1024,
+        EmbeddingModel::EmbeddingGemma300M => 768,
         _ => 768,
     }
 }
@@ -43,5 +44,6 @@ mod tests {
         assert_eq!(dimension(&EmbeddingModel::AllMiniLML6V2), 384);
         assert_eq!(dimension(&EmbeddingModel::NomicEmbedTextV15), 768);
         assert_eq!(dimension(&EmbeddingModel::BGELargeENV15), 1024);
+        assert_eq!(dimension(&EmbeddingModel::EmbeddingGemma300M), 768);
     }
 }
