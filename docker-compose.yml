@@ -3,6 +3,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        EMBEDDING_MODELS: ${EMBEDDING_MODELS:-nomic,bge-small}
     image: embedding:latest
     container_name: embedding
     ports:
@@ -10,5 +12,8 @@ services:
     env_file:
       - .env
     volumes:
-      - ./models:/home/embedder/models
+      - models:/home/embedder/models
     restart: unless-stopped
+
+volumes:
+  models:
