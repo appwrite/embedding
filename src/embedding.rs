@@ -141,8 +141,12 @@ impl EmbeddingClient {
 
         // Run a warmup inference so the ONNX Runtime arena is allocated before
         // we measure memory.  Without this, per_instance only captures model
-        // weights and misses the arena buffers.
-        let _ = first_model.embed(vec!["warmup"], None);
+        // weights and misses the arena buffers.  A failure here means the model
+        // can't serve requests at all, so fail loudly — swallowing it would let
+        // the memory delta read ~0 and silently mis-size the pool (no OOM guard).
+        first_model
+            .embed(vec!["warmup"], None)
+            .map_err(|e| format!("warmup inference failed for {}: {}", model_name, e))?;
 
         sys.refresh_memory();
         let memory_after_loading_model = sys.available_memory();
