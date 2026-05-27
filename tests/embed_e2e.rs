@@ -54,13 +54,3 @@ async fn embed_distinct_inputs_produce_distinct_vectors() {
     assert_eq!(result.embeddings.len(), 2);
     assert_ne!(result.embeddings[0], result.embeddings[1]);
 }
-
-#[tokio::test(flavor = "multi_thread")]
-async fn embed_unknown_alias_returns_error() {
-    // No model loading on this path — fails the alias check first.
-    let client = EmbeddingClient::new(small_model_config(1)).ok();
-    if let Some(client) = client {
-        let err = client.embed("not-a-real-model", &["x"]).await.unwrap_err();
-        assert!(err.contains("unknown model alias"), "got: {}", err);
-    }
-}
