@@ -1,3 +1,4 @@
+use crate::error::EmbedError;
 use crate::model::{self, EmbeddingModel};
 use fastembed::{ExecutionProviderDispatch, InitOptions, TextEmbedding, get_cache_dir};
 use hf_hub::api::sync::ApiBuilder;
@@ -251,17 +252,19 @@ impl EmbeddingClient {
         TextEmbedding::try_new(init_options)
             .map_err(|e| format!("Failed to initialize embedding model: {}", e))
     }
-    pub async fn embed(&self, model_name: &str, texts: &[&str]) -> Result<EmbeddingResult, String> {
+    pub async fn embed(
+        &self,
+        model_name: &str,
+        texts: &[&str],
+    ) -> Result<EmbeddingResult, EmbedError> {
         let started = std::time::Instant::now();
-        // Accept any alias the user might type ("minilm", "all-minilm", "MiniLM"…)
-        // by resolving to the canonical Debug name we used as the HashMap key.
-        let resolved = model::from_name(model_name)
-            .ok_or_else(|| format!("unknown model alias: {}", model_name))?;
+        let resolved = model::from_name(model_name).ok_or_else(|| {
+            EmbedError::UnknownModel(format!("unknown model alias: {}", model_name))
+        })?;
         let canonical = format!("{:?}", resolved);
-        let loaded = self
-            .models
-            .get(&canonical)
-            .ok_or_else(|| format!("model not allowed: {}", model_name))?;
+        let loaded = self.models.get(&canonical).ok_or_else(|| {
+            EmbedError::UnknownModel(format!("model not allowed: {}", model_name))
+        })?;
 
         let sub_batch = if self.sub_batch_override > 0 {
             self.sub_batch_override

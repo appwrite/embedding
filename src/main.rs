@@ -9,7 +9,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use embedding::{EmbeddingClient, EmbeddingConfig};
+use embedding::{EmbedError, EmbeddingClient, EmbeddingConfig};
 
 #[derive(Clone)]
 struct AppState {
@@ -54,7 +54,10 @@ async fn embed(
         .client
         .embed(&req.model, &refs)
         .await
-        .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        .map_err(|e| match e {
+            EmbedError::UnknownModel(msg) => AppError(StatusCode::BAD_REQUEST, msg),
+            EmbedError::Internal(msg) => AppError(StatusCode::INTERNAL_SERVER_ERROR, msg),
+        })?;
 
     Ok(Json(EmbedResponse {
         model: result.model,
