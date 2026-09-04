@@ -34,6 +34,13 @@ fn default_pool_size() -> usize {
         .unwrap_or(2)
 }
 
+fn memory_budget(host_available: u64, cgroup_free: Option<u64>) -> u64 {
+    match cgroup_free {
+        Some(cgroup_free) => host_available.min(cgroup_free),
+        None => host_available,
+    }
+}
+
 fn next_index(counter: &AtomicUsize, len: usize) -> usize {
     counter.fetch_add(1, Ordering::Relaxed) % len
 }
@@ -129,7 +136,10 @@ impl EmbeddingClient {
         // loading instance and measuring memory footprint
         let mut sys = sysinfo::System::new();
         sys.refresh_memory();
-        let mem_before_loading_model = sys.available_memory();
+        let mem_before_loading_model = memory_budget(
+            sys.available_memory(),
+            sys.cgroup_limits().map(|limits| limits.free_memory),
+        );
 
         let has_gpu_providers = !config.execution_providers.is_empty();
 
@@ -149,7 +159,10 @@ impl EmbeddingClient {
             .map_err(|e| format!("warmup inference failed for {}: {}", model_name, e))?;
 
         sys.refresh_memory();
-        let memory_after_loading_model = sys.available_memory();
+        let memory_after_loading_model = memory_budget(
+            sys.available_memory(),
+            sys.cgroup_limits().map(|limits| limits.free_memory),
+        );
         let per_instance_loaded =
             mem_before_loading_model.saturating_sub(memory_after_loading_model);
 
@@ -165,6 +178,16 @@ impl EmbeddingClient {
         // 60% of memory that was available before loading first model
         let budget = mem_before_loading_model * 6 / 10;
         let pool_size = if let Some(max_memory) = budget.checked_div(per_instance_bytes) {
+            if max_memory == 0 {
+                tracing::warn!(
+                    estimated_with_arena_mb = per_instance_bytes / (1024 * 1024),
+                    budget_mb = budget / (1024 * 1024),
+                    "A single {} instance is estimated to exceed the memory budget; \
+                     running with pool_size=1 but the process may be OOM-killed under load. \
+                     Raise the container memory limit or pick a smaller model.",
+                    model_name
+                );
+            }
             let max_memory = (max_memory as usize).max(1);
             let capped = max_memory.min(desired_pool_size);
             tracing::info!(
@@ -273,7 +296,13 @@ impl EmbeddingClient {
         let sub_batch = if self.sub_batch_override > 0 {
             self.sub_batch_override
         } else {
-            Self::compute_sub_batch(loaded.dimension, self.gpu)
+            let mut sys = sysinfo::System::new();
+            sys.refresh_memory();
+            let available_mb = memory_budget(
+                sys.available_memory(),
+                sys.cgroup_limits().map(|limits| limits.free_memory),
+            ) / (1024 * 1024);
+            Self::compute_sub_batch(available_mb, loaded.dimension, self.gpu)
         };
 
         let mut handles = Vec::new();
@@ -325,20 +354,11 @@ impl EmbeddingClient {
 
     /// Compute sub-batch size based on available system memory.
     ///
-    /// Uses 50% of available RAM as a budget.  Falls back to 32 if sysinfo
-    /// reports 0.
+    /// Uses 50% of available RAM as a budget.
     /// When GPU is enabled, the upper clamp is raised to 256 (GPU VRAM can
     /// handle much larger batches than CPU).
     /// TODO: add here the config batch size
-    fn compute_sub_batch(dimension: usize, gpu: bool) -> usize {
-        let mut sys = sysinfo::System::new();
-        sys.refresh_memory();
-        let available_mb = sys.available_memory() / (1024 * 1024);
-
-        if available_mb == 0 {
-            return 32;
-        }
-
+    fn compute_sub_batch(available_mb: u64, dimension: usize, gpu: bool) -> usize {
         // Per-text memory estimate for ONNX inference.  Attention matrices
         // dominate: heads × seq² × 4 bytes.  For 768-dim BERT-like models
         // (12 heads) processing ~1000-2000 token code chunks, attention alone
@@ -347,7 +367,7 @@ impl EmbeddingClient {
         let mb_per_text: u64 = if dimension >= 768 { 100 } else { 40 };
         let budget_mb = available_mb / 2;
         let max_batch = if gpu { 256 } else { 16 };
-        (budget_mb / mb_per_text).clamp(4, max_batch) as usize
+        (budget_mb / mb_per_text).clamp(1, max_batch) as usize
     }
 }
 
@@ -403,6 +423,14 @@ mod tests {
         unsafe {
             std::env::set_var(k, v);
         }
+    }
+
+    #[test]
+    fn memory_budget_is_capped_by_cgroup_limit() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        assert_eq!(memory_budget(32 * GIB, None), 32 * GIB);
+        assert_eq!(memory_budget(32 * GIB, Some(GIB)), GIB);
+        assert_eq!(memory_budget(2 * GIB, Some(32 * GIB)), 2 * GIB);
     }
 
     #[test]
@@ -523,33 +551,17 @@ mod tests {
     }
 
     #[test]
-    fn compute_sub_batch_cpu_768_within_clamp() {
-        let result = EmbeddingClient::compute_sub_batch(768, false);
-        // 32 is the sysinfo-zero fallback; otherwise the CPU clamp is [4, 16].
-        assert!(
-            result == 32 || (4..=16).contains(&result),
-            "got {} for cpu/768",
-            result
+    fn compute_sub_batch_shrinks_to_fit_small_budgets() {
+        assert_eq!(EmbeddingClient::compute_sub_batch(0, 768, false), 1);
+        // 200 MiB free -> 100 MiB budget -> one 100 MiB text, not four.
+        assert_eq!(EmbeddingClient::compute_sub_batch(200, 768, false), 1);
+        assert_eq!(
+            EmbeddingClient::compute_sub_batch(64 * 1024, 768, false),
+            16
         );
-    }
-
-    #[test]
-    fn compute_sub_batch_cpu_384_within_clamp() {
-        let result = EmbeddingClient::compute_sub_batch(384, false);
-        assert!(
-            result == 32 || (4..=16).contains(&result),
-            "got {} for cpu/384",
-            result
-        );
-    }
-
-    #[test]
-    fn compute_sub_batch_gpu_raises_ceiling() {
-        let result = EmbeddingClient::compute_sub_batch(768, true);
-        assert!(
-            result == 32 || (4..=256).contains(&result),
-            "got {} for gpu/768",
-            result
+        assert_eq!(
+            EmbeddingClient::compute_sub_batch(64 * 1024, 768, true),
+            256
         );
     }
 
