@@ -5,6 +5,11 @@ use std::time::Duration;
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+// Make jemalloc override libc malloc so ONNX Runtime's C++ allocations
+// (the bulk of idle RSS) go through jemalloc and can be returned to the OS.
+#[cfg(not(target_env = "msvc"))]
+use tikv_jemalloc_sys as _;
+
 use axum::{
     Json, Router,
     extract::State,

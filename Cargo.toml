@@ -17,4 +17,5 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
-tikv-jemallocator = "0.6"
+tikv-jemallocator = { version = "0.6", features = ["override_allocator_on_supported_platforms"] }
+tikv-jemalloc-sys = "0.6"
