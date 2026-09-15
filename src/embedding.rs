@@ -10,8 +10,6 @@ use std::sync::{
 };
 use tokenizers::Tokenizer;
 
-/// Default number of ONNX sessions per model when `EMBEDDING_POOL_SIZE` is unset.
-pub const DEFAULT_POOL_SIZE: usize = 1;
 /// Unload a model this many seconds after last use. `0` disables unloading.
 pub const DEFAULT_IDLE_UNLOAD_SECS: u64 = 300;
 
@@ -39,6 +37,10 @@ fn available_cpus() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(2)
+}
+
+fn default_pool_size() -> usize {
+    available_cpus()
 }
 
 fn default_intra_threads() -> usize {
@@ -94,7 +96,7 @@ impl EmbeddingConfig {
 
         let pool_size = parse_usize_env("EMBEDDING_POOL_SIZE")
             .filter(|&n| n >= 1)
-            .unwrap_or(DEFAULT_POOL_SIZE);
+            .unwrap_or_else(default_pool_size);
 
         let intra_threads = parse_usize_env("EMBEDDING_INTRA_THREADS")
             .filter(|&n| n >= 1)
@@ -133,11 +135,22 @@ struct LoadedModel {
     inner: Mutex<ModelSlot>,
     dimension: usize,
     last_access: AtomicU64,
+    in_flight: AtomicUsize,
 }
 
 struct ModelSlot {
     pool: Option<Vec<Arc<Mutex<TextEmbedding>>>>,
     tokenizer: Option<Arc<Tokenizer>>,
+}
+
+struct InFlightGuard<'a> {
+    counter: &'a AtomicUsize,
+}
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 struct BuiltModel {
@@ -165,6 +178,7 @@ impl EmbeddingClient {
                     }),
                     dimension: model::dimension(model),
                     last_access: AtomicU64::new(0),
+                    in_flight: AtomicUsize::new(0),
                 },
             );
         }
@@ -204,6 +218,11 @@ impl EmbeddingClient {
                 Ok(slot) => slot,
                 Err(poisoned) => poisoned.into_inner(),
             };
+            // Recheck under the pool lock so we never drop sessions that an
+            // in-flight embed already acquired (which would reload a second pool).
+            if loaded.in_flight.load(Ordering::SeqCst) > 0 {
+                continue;
+            }
             if slot.pool.is_some() || slot.tokenizer.is_some() {
                 slot.pool = None;
                 slot.tokenizer = None;
@@ -282,16 +301,14 @@ impl EmbeddingClient {
         // so this is a cache hit (no network) after the first model load.
         let tokenizer = Arc::new(Self::load_tokenizer(model, config)?);
 
-        let pool_size = if let Some(mem_before_loading_model) = mem_before_loading_model {
-            // ONNX model loading memory != actual inference memory.
-            //
-            // `TextEmbedding::try_new()` mainly loads weights / graph / session.
-            // ONNX Runtime lazily allocates execution memory on first inference.
-            // Warmup before measuring so extra pool slots are not oversized.
-            first_model
-                .embed(vec!["warmup"], None)
-                .map_err(|e| format!("warmup inference failed for {}: {}", model_name, e))?;
+        // Always run one inference so Docker warmup (pool_size=1) still proves
+        // the session can execute, and so extra pool slots are sized from a
+        // post-arena RSS delta when desired_pool_size > 1.
+        first_model
+            .embed(vec!["warmup"], None)
+            .map_err(|e| format!("warmup inference failed for {}: {}", model_name, e))?;
 
+        let pool_size = if let Some(mem_before_loading_model) = mem_before_loading_model {
             let mut sys = sysinfo::System::new();
             sys.refresh_memory();
             let memory_after_loading_model = memory_budget(
@@ -341,16 +358,21 @@ impl EmbeddingClient {
         } else {
             tracing::info!(
                 model = model_name,
-                "Skipping warmup inference; pool_size=1 does not need a memory-based cap"
+                "Using pool_size=1; extra sessions are not created"
             );
             1
         };
+
+        let mut extra_config = config.clone();
+        extra_config.intra_threads = (available_cpus() / pool_size)
+            .max(1)
+            .min(config.intra_threads);
 
         let mut pool = Vec::with_capacity(pool_size);
         pool.push(Arc::new(Mutex::new(first_model)));
 
         for _ in 1..pool_size {
-            let inst = Self::init_model(model, config)?;
+            let inst = Self::init_model(model, &extra_config)?;
             pool.push(Arc::new(Mutex::new(inst)));
         }
 
@@ -459,6 +481,10 @@ impl EmbeddingClient {
         })?;
 
         loaded.last_access.store(unix_now(), Ordering::Relaxed);
+        loaded.in_flight.fetch_add(1, Ordering::SeqCst);
+        let _in_flight = InFlightGuard {
+            counter: &loaded.in_flight,
+        };
 
         let sub_batch = if self.sub_batch_override > 0 {
             self.sub_batch_override
@@ -604,7 +630,7 @@ mod tests {
         let cfg = EmbeddingConfig::from_env();
         assert!(matches!(cfg.models[0], EmbeddingModel::NomicEmbedTextV15));
         assert_eq!(cfg.cache_dir, None);
-        assert_eq!(cfg.pool_size, DEFAULT_POOL_SIZE);
+        assert_eq!(cfg.pool_size, available_cpus());
         assert!(cfg.show_download_progress);
         assert!(cfg.execution_providers.is_empty());
         assert_eq!(cfg.sub_batch_size, 0);
@@ -707,7 +733,7 @@ mod tests {
         let _g = isolate_env();
         set("EMBEDDING_POOL_SIZE", "0");
         let cfg = EmbeddingConfig::from_env();
-        assert_eq!(cfg.pool_size, DEFAULT_POOL_SIZE);
+        assert_eq!(cfg.pool_size, available_cpus());
     }
 
     #[test]
@@ -715,7 +741,7 @@ mod tests {
         let _g = isolate_env();
         set("EMBEDDING_POOL_SIZE", "not-a-number");
         let cfg = EmbeddingConfig::from_env();
-        assert_eq!(cfg.pool_size, DEFAULT_POOL_SIZE);
+        assert_eq!(cfg.pool_size, available_cpus());
     }
 
     #[test]
@@ -799,6 +825,12 @@ mod tests {
         assert_eq!(next_index(&counter, 3), 2);
         assert_eq!(next_index(&counter, 3), 0);
         assert_eq!(next_index(&counter, 3), 1);
+    }
+
+    #[test]
+    fn default_pool_size_follows_cpu_count() {
+        assert_eq!(default_pool_size(), available_cpus());
+        assert!(default_pool_size() >= 1);
     }
 
     #[test]
