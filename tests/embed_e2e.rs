@@ -8,6 +8,8 @@ fn small_model_config(pool_size: usize) -> EmbeddingConfig {
         pool_size,
         execution_providers: Vec::new(),
         sub_batch_size: 0,
+        intra_threads: 1,
+        idle_unload_secs: 0,
     }
 }
 

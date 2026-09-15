@@ -13,7 +13,8 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         "warmup: downloading and initializing {} model(s)",
         config.models.len()
     );
-    let _ = EmbeddingClient::new(config)?;
+    let client = EmbeddingClient::new(config)?;
+    client.preload()?;
     tracing::info!("warmup: models cached and ready");
 
     Ok(())

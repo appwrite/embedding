@@ -1,4 +1,9 @@
 use std::sync::Arc;
+use std::time::Duration;
+
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use axum::{
     Json, Router,
@@ -81,7 +86,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .init();
 
     let config = EmbeddingConfig::from_env();
+    let idle_unload_secs = config.idle_unload_secs;
     let client = Arc::new(EmbeddingClient::new(config)?);
+
+    if idle_unload_secs > 0 {
+        let client_bg = client.clone();
+        let tick_secs = (idle_unload_secs / 6).clamp(10, 30);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(tick_secs));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            ticker.tick().await; // skip the immediate first tick
+            loop {
+                ticker.tick().await;
+                client_bg.unload_idle();
+            }
+        });
+        tracing::info!(idle_unload_secs, tick_secs, "idle model unload enabled");
+    }
+
     let state = AppState { client };
 
     let app = Router::new()

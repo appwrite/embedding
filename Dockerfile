@@ -34,7 +34,7 @@ COPY --from=builder /usr/local/bin/warmup /usr/local/bin/warmup
 # the model set with `--build-arg EMBEDDING_MODELS=...` (docker compose passes
 # this from .env). Pool size is forced to 1 to keep the build's memory low —
 # it only affects the warmup, not the runtime pool.
-ARG EMBEDDING_MODELS=nomic,bge-small
+ARG EMBEDDING_MODELS=nomic
 RUN EMBEDDING_MODELS="${EMBEDDING_MODELS}" EMBEDDING_POOL_SIZE=1 /usr/local/bin/warmup
 
 # EXPOSE is build-time metadata only; the actual port is controlled by the
