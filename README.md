@@ -10,7 +10,7 @@ docker compose up --build
 
 First request triggers the model download into `./models` (bind-mounted into the container); subsequent restarts reuse it.
 
-`GET /health` is liveness: it stays `200` while unused so idle RSS is not pinned. After a failed model load it returns `503` with the error so a broken cache is visible without calling `/embed`. Failed loads are retried at most once every 30 seconds.
+`GET /health` is liveness: it stays `200` while unused so idle RSS is not pinned. After a failed model load it returns `503` with the error for 30 seconds, then `200` again so a probe can recover; the next `/embed` retries the load.
 
 ```bash
 curl -X POST http://localhost:3000/embed \
@@ -55,4 +55,4 @@ Errors:
 
 - `400 Bad Request` — `texts` is empty or the model alias is not in `EMBEDDING_MODELS`.
 - `500 Internal Server Error` — embedding or tokenizer failure (message in `error` field).
-- `503 Service Unavailable` — `GET /health` after a model load has failed (message in `error` field).
+- `503 Service Unavailable` — `GET /health` for 30 seconds after a model load has failed (message in `error` field).

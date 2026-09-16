@@ -160,7 +160,7 @@ impl EmbeddingConfig {
 }
 
 pub struct EmbeddingClient {
-    models: HashMap<String, LoadedModel>,
+    models: HashMap<String, Arc<LoadedModel>>,
     config: EmbeddingConfig,
     sub_batch_override: usize,
     gpu: bool,
@@ -213,7 +213,7 @@ impl EmbeddingClient {
             let model_name = format!("{:?}", model);
             models.insert(
                 model_name.clone(),
-                LoadedModel {
+                Arc::new(LoadedModel {
                     spec: model.clone(),
                     model_name,
                     next: AtomicUsize::new(0),
@@ -227,7 +227,7 @@ impl EmbeddingClient {
                     in_flight: AtomicUsize::new(0),
                     last_failure: Mutex::new(None),
                     cached_pool_size: AtomicUsize::new(0),
-                },
+                }),
             );
         }
 
@@ -251,17 +251,13 @@ impl EmbeddingClient {
         Ok(())
     }
 
-    /// Most recent model-load failure, if any. Used by `/health` so a stuck
-    /// cache or unreadable `EMBEDDING_CACHE_DIR` is visible without `/embed`.
+    /// Most recent in-window model-load failure, if any. Used by `/health`.
+    /// The error expires with the 30s retry window so a liveness probe can
+    /// recover; the next `/embed` then retries the load.
     pub fn last_load_error(&self) -> Option<String> {
-        for loaded in self.models.values() {
-            if let Ok(guard) = loaded.last_failure.lock()
-                && let Some(fail) = guard.as_ref()
-            {
-                return Some(fail.message.clone());
-            }
-        }
-        None
+        self.models
+            .values()
+            .find_map(|loaded| Self::cached_load_error(loaded))
     }
 
     /// Drop ONNX sessions that have been unused for `idle_unload_secs`.
@@ -329,14 +325,9 @@ impl EmbeddingClient {
         }
     }
 
-    fn finish_load(&self, loaded: &LoadedModel) -> Result<(), String> {
+    fn finish_load(loaded: &LoadedModel, config: &EmbeddingConfig) -> Result<(), String> {
         let cached_pool_size = loaded.cached_pool_size.load(Ordering::Relaxed);
-        match Self::load_model(
-            &loaded.spec,
-            &loaded.model_name,
-            &self.config,
-            cached_pool_size,
-        ) {
+        match Self::load_model(&loaded.spec, &loaded.model_name, config, cached_pool_size) {
             Ok(built) => {
                 loaded
                     .cached_pool_size
@@ -357,7 +348,7 @@ impl EmbeddingClient {
         }
     }
 
-    async fn ensure_loaded(&self, loaded: &LoadedModel) -> Result<(), String> {
+    async fn ensure_loaded(&self, loaded: &Arc<LoadedModel>) -> Result<(), String> {
         if Self::slot_is_loaded(loaded)? {
             return Ok(());
         }
@@ -371,7 +362,11 @@ impl EmbeddingClient {
         if let Some(err) = Self::cached_load_error(loaded) {
             return Err(err);
         }
-        tokio::task::block_in_place(|| self.finish_load(loaded))
+        let loaded = Arc::clone(loaded);
+        let config = self.config.clone();
+        tokio::task::spawn_blocking(move || Self::finish_load(&loaded, &config))
+            .await
+            .map_err(|e| format!("Failed to join model load: {}", e))?
     }
 
     fn ensure_loaded_blocking(&self, loaded: &LoadedModel) -> Result<(), String> {
@@ -388,7 +383,7 @@ impl EmbeddingClient {
         if let Some(err) = Self::cached_load_error(loaded) {
             return Err(err);
         }
-        self.finish_load(loaded)
+        Self::finish_load(loaded, &self.config)
     }
 
     fn load_model(
@@ -603,7 +598,7 @@ impl EmbeddingClient {
 
     async fn acquire_instance(
         &self,
-        loaded: &LoadedModel,
+        loaded: &Arc<LoadedModel>,
     ) -> Result<Arc<Mutex<TextEmbedding>>, String> {
         for _ in 0..2 {
             self.ensure_loaded(loaded).await?;
@@ -622,7 +617,7 @@ impl EmbeddingClient {
         ))
     }
 
-    async fn tokenizer(&self, loaded: &LoadedModel) -> Result<Arc<Tokenizer>, String> {
+    async fn tokenizer(&self, loaded: &Arc<LoadedModel>) -> Result<Arc<Tokenizer>, String> {
         self.ensure_loaded(loaded).await?;
         let slot = loaded
             .inner
