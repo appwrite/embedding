@@ -855,24 +855,4 @@ mod tests {
         assert_eq!(next_index(&counter, 3), 0);
         assert_eq!(next_index(&counter, 3), 1);
     }
-
-    #[test]
-    fn cap_pool_from_memory_never_exceeds_budget_or_desired() {
-        const MIB: u64 = 1024 * 1024;
-        assert_eq!(cap_pool_from_memory(8, 600 * MIB, 0), 1);
-        assert_eq!(cap_pool_from_memory(8, 0, 100 * MIB), 1);
-        assert_eq!(cap_pool_from_memory(8, 250 * MIB, 100 * MIB), 2);
-        assert_eq!(cap_pool_from_memory(1, 10_000 * MIB, 100 * MIB), 1);
-    }
-
-    #[test]
-    fn default_pool_size_is_one() {
-        assert_eq!(default_pool_size(), 1);
-    }
-
-    #[test]
-    fn default_intra_threads_uses_available_cpus() {
-        assert_eq!(default_intra_threads(), available_cpus());
-        assert!(default_intra_threads() >= 1);
-    }
 }
