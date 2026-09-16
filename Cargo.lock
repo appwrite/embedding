@@ -592,7 +592,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sysinfo",
- "tikv-jemalloc-sys",
  "tikv-jemallocator",
  "tokenizers",
  "tokio",

@@ -8,10 +8,14 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicU64, AtomicUsize, Ordering},
 };
+use std::time::{Duration, Instant};
 use tokenizers::Tokenizer;
 
 /// Unload a model this many seconds after last use. `0` disables unloading.
 pub const DEFAULT_IDLE_UNLOAD_SECS: u64 = 300;
+
+/// After a failed load, skip another download/init for this long.
+const LOAD_RETRY_SECS: u64 = 30;
 
 #[derive(Debug, Clone)]
 pub struct EmbeddingResult {
@@ -64,14 +68,11 @@ fn intra_threads_for_pool(configured: usize, pool_size: usize, nproc: usize) -> 
 /// uncapped CPU-count pool.
 fn cap_pool_from_memory(desired: usize, budget: u64, per_instance_bytes: u64) -> usize {
     let desired = desired.max(1);
-    if per_instance_bytes == 0 {
+    if per_instance_bytes == 0 || budget == 0 {
         return 1;
     }
-    match budget.checked_div(per_instance_bytes) {
-        Some(0) => 1,
-        Some(max_from_memory) => desired.min(max_from_memory as usize).max(1),
-        None => 1,
-    }
+    let max_from_memory = (budget / per_instance_bytes) as usize;
+    desired.min(max_from_memory.max(1))
 }
 
 fn memory_budget(host_available: u64, cgroup_free: Option<u64>) -> u64 {
@@ -85,16 +86,27 @@ fn next_index(counter: &AtomicUsize, len: usize) -> usize {
     counter.fetch_add(1, Ordering::Relaxed) % len
 }
 
-fn unix_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+fn process_origin() -> Instant {
+    static ORIGIN: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    *ORIGIN.get_or_init(Instant::now)
+}
+
+fn mono_now_ms() -> u64 {
+    process_origin().elapsed().as_millis() as u64
+}
+
+fn touch_access(loaded: &LoadedModel) {
+    loaded
+        .last_access
+        .store(mono_now_ms().max(1), Ordering::Relaxed);
 }
 
 /// Whether an idle model slot should drop its ONNX sessions.
+/// `last_access` and `now` are monotonic milliseconds; `idle_unload_secs` is seconds.
 pub(crate) fn should_unload(last_access: u64, now: u64, idle_unload_secs: u64) -> bool {
-    idle_unload_secs > 0 && last_access > 0 && now.saturating_sub(last_access) >= idle_unload_secs
+    idle_unload_secs > 0
+        && last_access > 0
+        && now.saturating_sub(last_access) >= idle_unload_secs.saturating_mul(1000)
 }
 
 fn parse_usize_env(key: &str) -> Option<usize> {
@@ -158,11 +170,18 @@ struct LoadedModel {
     spec: EmbeddingModel,
     model_name: String,
     next: AtomicUsize,
-    load: Mutex<()>,
+    load: tokio::sync::Mutex<()>,
     inner: Mutex<ModelSlot>,
     dimension: usize,
     last_access: AtomicU64,
     in_flight: AtomicUsize,
+    last_failure: Mutex<Option<LoadFailure>>,
+    cached_pool_size: AtomicUsize,
+}
+
+struct LoadFailure {
+    message: String,
+    at: Instant,
 }
 
 struct ModelSlot {
@@ -198,7 +217,7 @@ impl EmbeddingClient {
                     spec: model.clone(),
                     model_name,
                     next: AtomicUsize::new(0),
-                    load: Mutex::new(()),
+                    load: tokio::sync::Mutex::new(()),
                     inner: Mutex::new(ModelSlot {
                         pool: None,
                         tokenizer: None,
@@ -206,6 +225,8 @@ impl EmbeddingClient {
                     dimension: model::dimension(model),
                     last_access: AtomicU64::new(0),
                     in_flight: AtomicUsize::new(0),
+                    last_failure: Mutex::new(None),
+                    cached_pool_size: AtomicUsize::new(0),
                 },
             );
         }
@@ -224,10 +245,23 @@ impl EmbeddingClient {
     /// builds still populate the ONNX cache.
     pub fn preload(&self) -> Result<(), String> {
         for loaded in self.models.values() {
-            self.ensure_loaded(loaded)?;
-            loaded.last_access.store(unix_now(), Ordering::Relaxed);
+            self.ensure_loaded_blocking(loaded)?;
+            touch_access(loaded);
         }
         Ok(())
+    }
+
+    /// Most recent model-load failure, if any. Used by `/health` so a stuck
+    /// cache or unreadable `EMBEDDING_CACHE_DIR` is visible without `/embed`.
+    pub fn last_load_error(&self) -> Option<String> {
+        for loaded in self.models.values() {
+            if let Ok(guard) = loaded.last_failure.lock()
+                && let Some(fail) = guard.as_ref()
+            {
+                return Some(fail.message.clone());
+            }
+        }
+        None
     }
 
     /// Drop ONNX sessions that have been unused for `idle_unload_secs`.
@@ -235,7 +269,7 @@ impl EmbeddingClient {
         if self.config.idle_unload_secs == 0 {
             return;
         }
-        let now = unix_now();
+        let now = mono_now_ms();
         for loaded in self.models.values() {
             let last = loaded.last_access.load(Ordering::Relaxed);
             if !should_unload(last, now, self.config.idle_unload_secs) {
@@ -255,67 +289,140 @@ impl EmbeddingClient {
                 slot.tokenizer = None;
                 tracing::info!(
                     model = loaded.model_name.as_str(),
-                    idle_secs = now.saturating_sub(last),
+                    idle_ms = now.saturating_sub(last),
                     "unloaded idle embedding model"
                 );
             }
         }
     }
 
-    pub fn idle_unload_secs(&self) -> u64 {
-        self.config.idle_unload_secs
-    }
-
-    fn ensure_loaded(&self, loaded: &LoadedModel) -> Result<(), String> {
-        {
-            let slot = loaded
-                .inner
-                .lock()
-                .map_err(|e| format!("Embedding model lock poisoned: {}", e))?;
-            if slot.pool.is_some() && slot.tokenizer.is_some() {
-                return Ok(());
-            }
-        }
-
-        let _load = loaded
-            .load
-            .lock()
-            .map_err(|e| format!("Embedding model lock poisoned: {}", e))?;
-        {
-            let slot = loaded
-                .inner
-                .lock()
-                .map_err(|e| format!("Embedding model lock poisoned: {}", e))?;
-            if slot.pool.is_some() && slot.tokenizer.is_some() {
-                return Ok(());
-            }
-        }
-
-        let built = Self::load_model(&loaded.spec, &loaded.model_name, &self.config)?;
-
-        let mut slot = loaded
+    fn slot_is_loaded(loaded: &LoadedModel) -> Result<bool, String> {
+        let slot = loaded
             .inner
             .lock()
             .map_err(|e| format!("Embedding model lock poisoned: {}", e))?;
-        slot.pool = Some(built.pool);
-        slot.tokenizer = Some(built.tokenizer);
-        Ok(())
+        Ok(slot.pool.is_some() && slot.tokenizer.is_some())
+    }
+
+    fn cached_load_error(loaded: &LoadedModel) -> Option<String> {
+        let guard = loaded.last_failure.lock().ok()?;
+        let fail = guard.as_ref()?;
+        if fail.at.elapsed() < Duration::from_secs(LOAD_RETRY_SECS) {
+            Some(fail.message.clone())
+        } else {
+            None
+        }
+    }
+
+    fn record_load_failure(loaded: &LoadedModel, message: String) {
+        if let Ok(mut guard) = loaded.last_failure.lock() {
+            *guard = Some(LoadFailure {
+                message,
+                at: Instant::now(),
+            });
+        }
+    }
+
+    fn clear_load_failure(loaded: &LoadedModel) {
+        if let Ok(mut guard) = loaded.last_failure.lock() {
+            *guard = None;
+        }
+    }
+
+    fn finish_load(&self, loaded: &LoadedModel) -> Result<(), String> {
+        let cached_pool_size = loaded.cached_pool_size.load(Ordering::Relaxed);
+        match Self::load_model(
+            &loaded.spec,
+            &loaded.model_name,
+            &self.config,
+            cached_pool_size,
+        ) {
+            Ok(built) => {
+                loaded
+                    .cached_pool_size
+                    .store(built.pool.len(), Ordering::Relaxed);
+                let mut slot = loaded
+                    .inner
+                    .lock()
+                    .map_err(|e| format!("Embedding model lock poisoned: {}", e))?;
+                slot.pool = Some(built.pool);
+                slot.tokenizer = Some(built.tokenizer);
+                Self::clear_load_failure(loaded);
+                Ok(())
+            }
+            Err(err) => {
+                Self::record_load_failure(loaded, err.clone());
+                Err(err)
+            }
+        }
+    }
+
+    async fn ensure_loaded(&self, loaded: &LoadedModel) -> Result<(), String> {
+        if Self::slot_is_loaded(loaded)? {
+            return Ok(());
+        }
+        if let Some(err) = Self::cached_load_error(loaded) {
+            return Err(err);
+        }
+        let _load = loaded.load.lock().await;
+        if Self::slot_is_loaded(loaded)? {
+            return Ok(());
+        }
+        if let Some(err) = Self::cached_load_error(loaded) {
+            return Err(err);
+        }
+        tokio::task::block_in_place(|| self.finish_load(loaded))
+    }
+
+    fn ensure_loaded_blocking(&self, loaded: &LoadedModel) -> Result<(), String> {
+        if Self::slot_is_loaded(loaded)? {
+            return Ok(());
+        }
+        if let Some(err) = Self::cached_load_error(loaded) {
+            return Err(err);
+        }
+        let _load = loaded.load.blocking_lock();
+        if Self::slot_is_loaded(loaded)? {
+            return Ok(());
+        }
+        if let Some(err) = Self::cached_load_error(loaded) {
+            return Err(err);
+        }
+        self.finish_load(loaded)
     }
 
     fn load_model(
         model: &EmbeddingModel,
         model_name: &str,
         config: &EmbeddingConfig,
+        cached_pool_size: usize,
     ) -> Result<BuiltModel, String> {
         let desired_pool_size = config.pool_size.max(1);
         let dimension = model::dimension(model);
         let has_gpu_providers = !config.execution_providers.is_empty();
         let nproc = available_cpus();
-        let probe_intra = intra_threads_for_pool(config.intra_threads, desired_pool_size, nproc);
-        let mut probe_config = config.clone();
-        probe_config.intra_threads = probe_intra;
 
-        let mem_before_loading_model = if desired_pool_size > 1 {
+        let known_pool_size = if desired_pool_size == 1 {
+            Some(1)
+        } else if cached_pool_size > 0 {
+            let reused = cached_pool_size.min(desired_pool_size).max(1);
+            if reused != cached_pool_size {
+                tracing::warn!(
+                    model = model_name,
+                    previous = cached_pool_size,
+                    new = reused,
+                    "reusing capped pool size from the first load"
+                );
+            }
+            Some(reused)
+        } else {
+            None
+        };
+
+        let probe_size = known_pool_size.unwrap_or(desired_pool_size);
+        let probe_intra = intra_threads_for_pool(config.intra_threads, probe_size, nproc);
+
+        let mem_before_loading_model = if known_pool_size.is_none() {
             let mut sys = sysinfo::System::new();
             sys.refresh_memory();
             Some(memory_budget(
@@ -326,13 +433,21 @@ impl EmbeddingClient {
             None
         };
 
-        let first_model = Self::init_and_warmup(model, &probe_config, model_name)?;
+        let first_model = Self::init_and_warmup(model, config, probe_intra, model_name)?;
 
         // Tokenizer is fetched from the same cache dir fastembed just populated,
         // so this is a cache hit (no network) after the first model load.
         let tokenizer = Arc::new(Self::load_tokenizer(model, config)?);
 
-        let pool_size = if let Some(mem_before_loading_model) = mem_before_loading_model {
+        let pool_size = if let Some(known) = known_pool_size {
+            if known == 1 {
+                tracing::info!(
+                    model = model_name,
+                    "Using pool_size=1; extra sessions are not created"
+                );
+            }
+            known
+        } else if let Some(mem_before_loading_model) = mem_before_loading_model {
             let mut sys = sysinfo::System::new();
             sys.refresh_memory();
             let memory_after_loading_model = memory_budget(
@@ -379,30 +494,30 @@ impl EmbeddingClient {
             );
             capped
         } else {
-            tracing::info!(
-                model = model_name,
-                "Using pool_size=1; extra sessions are not created"
-            );
             1
         };
 
         let session_intra = intra_threads_for_pool(config.intra_threads, pool_size, nproc);
-        let mut session_config = config.clone();
-        session_config.intra_threads = session_intra;
 
         let mut pool = Vec::with_capacity(pool_size);
         if session_intra == probe_intra {
             pool.push(Arc::new(Mutex::new(first_model)));
         } else {
+            // RAM cap changed the pool size, so the probe session was built
+            // with the wrong intra-op thread count. Drop it and rebuild the
+            // serving session (with warmup) at the final count. The probe
+            // measured a session with fewer threads than serving will use,
+            // so the cap can underestimate RSS.
             drop(first_model);
             pool.push(Arc::new(Mutex::new(Self::init_and_warmup(
                 model,
-                &session_config,
+                config,
+                session_intra,
                 model_name,
             )?)));
         }
         for _ in 1..pool_size {
-            let inst = Self::init_model(model, &session_config)?;
+            let inst = Self::init_model(model, config, session_intra)?;
             pool.push(Arc::new(Mutex::new(inst)));
         }
 
@@ -433,9 +548,10 @@ impl EmbeddingClient {
     fn init_and_warmup(
         model: &EmbeddingModel,
         config: &EmbeddingConfig,
+        intra_threads: usize,
         model_name: &str,
     ) -> Result<TextEmbedding, String> {
-        let mut inst = Self::init_model(model, config)?;
+        let mut inst = Self::init_model(model, config, intra_threads)?;
         Self::warmup_session(&mut inst, model_name)?;
         Ok(inst)
     }
@@ -466,10 +582,11 @@ impl EmbeddingClient {
     fn init_model(
         model: &EmbeddingModel,
         config: &EmbeddingConfig,
+        intra_threads: usize,
     ) -> Result<TextEmbedding, String> {
         let mut init_options = InitOptions::new(model.clone())
             .with_show_download_progress(config.show_download_progress)
-            .with_intra_threads(config.intra_threads);
+            .with_intra_threads(intra_threads);
 
         if let Some(cache_dir) = &config.cache_dir {
             init_options = init_options.with_cache_dir(cache_dir.into());
@@ -484,9 +601,12 @@ impl EmbeddingClient {
             .map_err(|e| format!("Failed to initialize embedding model: {}", e))
     }
 
-    fn acquire_instance(&self, loaded: &LoadedModel) -> Result<Arc<Mutex<TextEmbedding>>, String> {
+    async fn acquire_instance(
+        &self,
+        loaded: &LoadedModel,
+    ) -> Result<Arc<Mutex<TextEmbedding>>, String> {
         for _ in 0..2 {
-            self.ensure_loaded(loaded)?;
+            self.ensure_loaded(loaded).await?;
             let slot = loaded
                 .inner
                 .lock()
@@ -502,8 +622,8 @@ impl EmbeddingClient {
         ))
     }
 
-    fn tokenizer(&self, loaded: &LoadedModel) -> Result<Arc<Tokenizer>, String> {
-        self.ensure_loaded(loaded)?;
+    async fn tokenizer(&self, loaded: &LoadedModel) -> Result<Arc<Tokenizer>, String> {
+        self.ensure_loaded(loaded).await?;
         let slot = loaded
             .inner
             .lock()
@@ -527,7 +647,7 @@ impl EmbeddingClient {
             EmbedError::UnknownModel(format!("model not allowed: {}", model_name))
         })?;
 
-        loaded.last_access.store(unix_now(), Ordering::Relaxed);
+        touch_access(loaded);
         loaded.in_flight.fetch_add(1, Ordering::SeqCst);
         let _in_flight = InFlightGuard {
             counter: &loaded.in_flight,
@@ -545,9 +665,12 @@ impl EmbeddingClient {
             Self::compute_sub_batch(available_mb, loaded.dimension, self.gpu)
         };
 
+        // Each chunk runs in spawn_blocking so ORT inference does not occupy
+        // a tokio worker. At pool_size=1 every chunk still serializes on the
+        // same session mutex; extra tasks are then just overhead.
         let mut handles = Vec::new();
         for chunk in texts.chunks(sub_batch) {
-            let inst = self.acquire_instance(loaded)?;
+            let inst = self.acquire_instance(loaded).await?;
             let chunked_texts: Vec<String> = chunk.iter().map(|t| (*t).to_owned()).collect();
 
             handles.push(tokio::task::spawn_blocking(move || {
@@ -567,7 +690,7 @@ impl EmbeddingClient {
             embeddings.append(&mut batch_result);
         }
 
-        let tokenizer = self.tokenizer(loaded)?;
+        let tokenizer = self.tokenizer(loaded).await?;
         let owned_texts: Vec<String> = texts.iter().map(|t| t.to_string()).collect();
         let tokens = tokio::task::spawn_blocking(move || -> Result<usize, String> {
             let encodings = tokenizer
@@ -578,7 +701,7 @@ impl EmbeddingClient {
         .await
         .map_err(|e| format!("Failed to join tokenizer task: {}", e))??;
 
-        loaded.last_access.store(unix_now(), Ordering::Relaxed);
+        touch_access(loaded);
 
         Ok(EmbeddingResult {
             model: loaded.model_name.clone(),
@@ -812,9 +935,9 @@ mod tests {
     #[test]
     fn should_unload_requires_prior_use_and_timeout() {
         assert!(!should_unload(0, 1_000, 300));
-        assert!(!should_unload(900, 1_000, 0));
-        assert!(!should_unload(800, 1_000, 300));
-        assert!(should_unload(700, 1_000, 300));
+        assert!(!should_unload(900_000, 1_000_000, 0));
+        assert!(!should_unload(800_000, 1_000_000, 300));
+        assert!(should_unload(700_000, 1_000_000, 300));
     }
 
     #[test]
