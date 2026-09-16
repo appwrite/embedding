@@ -170,7 +170,7 @@ struct LoadedModel {
     spec: EmbeddingModel,
     model_name: String,
     next: AtomicUsize,
-    load: tokio::sync::Mutex<()>,
+    load: Mutex<()>,
     inner: Mutex<ModelSlot>,
     dimension: usize,
     last_access: AtomicU64,
@@ -217,7 +217,7 @@ impl EmbeddingClient {
                     spec: model.clone(),
                     model_name,
                     next: AtomicUsize::new(0),
-                    load: tokio::sync::Mutex::new(()),
+                    load: Mutex::new(()),
                     inner: Mutex::new(ModelSlot {
                         pool: None,
                         tokenizer: None,
@@ -245,7 +245,7 @@ impl EmbeddingClient {
     /// builds still populate the ONNX cache.
     pub fn preload(&self) -> Result<(), String> {
         for loaded in self.models.values() {
-            self.ensure_loaded_blocking(loaded)?;
+            Self::ensure_loaded_blocking(loaded, &self.config)?;
             touch_access(loaded);
         }
         Ok(())
@@ -355,35 +355,33 @@ impl EmbeddingClient {
         if let Some(err) = Self::cached_load_error(loaded) {
             return Err(err);
         }
-        let _load = loaded.load.lock().await;
-        if Self::slot_is_loaded(loaded)? {
-            return Ok(());
-        }
-        if let Some(err) = Self::cached_load_error(loaded) {
-            return Err(err);
-        }
+        // The std mutex is acquired inside spawn_blocking so cancelling this
+        // request cannot drop load ownership while finish_load is still running.
         let loaded = Arc::clone(loaded);
         let config = self.config.clone();
-        tokio::task::spawn_blocking(move || Self::finish_load(&loaded, &config))
+        tokio::task::spawn_blocking(move || Self::ensure_loaded_blocking(&loaded, &config))
             .await
             .map_err(|e| format!("Failed to join model load: {}", e))?
     }
 
-    fn ensure_loaded_blocking(&self, loaded: &LoadedModel) -> Result<(), String> {
+    fn ensure_loaded_blocking(
+        loaded: &LoadedModel,
+        config: &EmbeddingConfig,
+    ) -> Result<(), String> {
         if Self::slot_is_loaded(loaded)? {
             return Ok(());
         }
         if let Some(err) = Self::cached_load_error(loaded) {
             return Err(err);
         }
-        let _load = loaded.load.blocking_lock();
+        let _load = loaded.load.lock().unwrap_or_else(|e| e.into_inner());
         if Self::slot_is_loaded(loaded)? {
             return Ok(());
         }
         if let Some(err) = Self::cached_load_error(loaded) {
             return Err(err);
         }
-        Self::finish_load(loaded, &self.config)
+        Self::finish_load(loaded, config)
     }
 
     fn load_model(
