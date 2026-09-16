@@ -47,6 +47,19 @@ fn default_intra_threads() -> usize {
     available_cpus()
 }
 
+/// Intra-op threads for each ONNX session in a pool. A single session keeps
+/// the configured value (CPU count by default). Extra sessions split CPUs
+/// so concurrent embeds cannot oversubscribe the host.
+fn intra_threads_for_pool(configured: usize, pool_size: usize, nproc: usize) -> usize {
+    let configured = configured.max(1);
+    let pool_size = pool_size.max(1);
+    if pool_size == 1 {
+        configured
+    } else {
+        (nproc / pool_size).max(1).min(configured)
+    }
+}
+
 /// Cap extra ONNX sessions so a failed RSS delta cannot fall back to an
 /// uncapped CPU-count pool.
 fn cap_pool_from_memory(desired: usize, budget: u64, per_instance_bytes: u64) -> usize {
@@ -297,6 +310,10 @@ impl EmbeddingClient {
         let desired_pool_size = config.pool_size.max(1);
         let dimension = model::dimension(model);
         let has_gpu_providers = !config.execution_providers.is_empty();
+        let nproc = available_cpus();
+        let probe_intra = intra_threads_for_pool(config.intra_threads, desired_pool_size, nproc);
+        let mut probe_config = config.clone();
+        probe_config.intra_threads = probe_intra;
 
         let mem_before_loading_model = if desired_pool_size > 1 {
             let mut sys = sysinfo::System::new();
@@ -309,7 +326,7 @@ impl EmbeddingClient {
             None
         };
 
-        let mut first_model = Self::init_model(model, config)?;
+        let mut first_model = Self::init_model(model, &probe_config)?;
 
         // Tokenizer is fetched from the same cache dir fastembed just populated,
         // so this is a cache hit (no network) after the first model load.
@@ -339,7 +356,6 @@ impl EmbeddingClient {
             // inference workloads (batch=8-32 texts of 1000-2000 tokens each).
             let per_instance_bytes = per_instance_loaded.saturating_mul(3);
 
-            let nproc = available_cpus();
             let budget = mem_before_loading_model * 6 / 10;
             let capped = cap_pool_from_memory(desired_pool_size, budget, per_instance_bytes);
             if per_instance_bytes == 0 {
@@ -377,16 +393,22 @@ impl EmbeddingClient {
             1
         };
 
-        let mut extra_config = config.clone();
-        extra_config.intra_threads = (available_cpus() / pool_size)
-            .max(1)
-            .min(config.intra_threads);
+        let session_intra = intra_threads_for_pool(config.intra_threads, pool_size, nproc);
+        let mut session_config = config.clone();
+        session_config.intra_threads = session_intra;
 
         let mut pool = Vec::with_capacity(pool_size);
-        pool.push(Arc::new(Mutex::new(first_model)));
-
+        if session_intra == probe_intra {
+            pool.push(Arc::new(Mutex::new(first_model)));
+        } else {
+            drop(first_model);
+            pool.push(Arc::new(Mutex::new(Self::init_model(
+                model,
+                &session_config,
+            )?)));
+        }
         for _ in 1..pool_size {
-            let inst = Self::init_model(model, &extra_config)?;
+            let inst = Self::init_model(model, &session_config)?;
             pool.push(Arc::new(Mutex::new(inst)));
         }
 
@@ -400,7 +422,7 @@ impl EmbeddingClient {
             model_name,
             dimension,
             pool_size,
-            config.intra_threads,
+            session_intra,
             ep_label,
         );
 
@@ -841,5 +863,14 @@ mod tests {
     fn default_intra_threads_uses_available_cpus() {
         assert_eq!(default_intra_threads(), available_cpus());
         assert!(default_intra_threads() >= 1);
+    }
+
+    #[test]
+    fn intra_threads_for_pool_splits_cpus_across_sessions() {
+        assert_eq!(intra_threads_for_pool(64, 1, 64), 64);
+        assert_eq!(intra_threads_for_pool(64, 4, 64), 16);
+        assert_eq!(intra_threads_for_pool(4, 4, 64), 4);
+        assert_eq!(intra_threads_for_pool(64, 8, 4), 1);
+        assert_eq!(intra_threads_for_pool(128, 1, 8), 128);
     }
 }
