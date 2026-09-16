@@ -25,8 +25,8 @@ Configured via environment variables (set them in `.env`):
 | `EMBEDDING_PORT` | `3000` | Port the service listens on. |
 | `EMBEDDING_MODELS` | `nomic` | Comma-separated list of models allowed to load. ONNX sessions are created on first `/embed`, not at process start. |
 | `EMBEDDING_CACHE_DIR` | _(default cache)_ | Directory for downloaded model files. |
-| `EMBEDDING_POOL_SIZE` | CPU count | Number of ONNX sessions per model while it is loaded, then capped by available RAM. Concurrent `/embed` calls round-robin across sessions. Idle unload drops every session. |
-| `EMBEDDING_INTRA_THREADS` | `min(4, nproc)` | ONNX Runtime intra-op threads per session. |
+| `EMBEDDING_POOL_SIZE` | `1` | Number of ONNX sessions per model while it is loaded, then capped by available RAM. Concurrent `/embed` calls round-robin across sessions. Raise this for parallel HTTP throughput; each extra session keeps another copy of the weights resident until idle unload. |
+| `EMBEDDING_INTRA_THREADS` | CPU count | ONNX Runtime intra-op threads per session. The default uses the whole machine on the single default session. |
 | `EMBEDDING_IDLE_UNLOAD_SECS` | `300` | Drop a model's sessions this many seconds after last use (`0` disables). The next `/embed` reloads the same checkpoint from `EMBEDDING_CACHE_DIR`. |
 
 ## API

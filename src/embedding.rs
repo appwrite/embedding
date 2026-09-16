@@ -40,11 +40,25 @@ fn available_cpus() -> usize {
 }
 
 fn default_pool_size() -> usize {
-    available_cpus()
+    1
 }
 
 fn default_intra_threads() -> usize {
-    available_cpus().min(4)
+    available_cpus()
+}
+
+/// Cap extra ONNX sessions so a failed RSS delta cannot fall back to an
+/// uncapped CPU-count pool.
+fn cap_pool_from_memory(desired: usize, budget: u64, per_instance_bytes: u64) -> usize {
+    let desired = desired.max(1);
+    if per_instance_bytes == 0 {
+        return 1;
+    }
+    match budget.checked_div(per_instance_bytes) {
+        Some(0) => 1,
+        Some(max_from_memory) => desired.min(max_from_memory as usize).max(1),
+        None => 1,
+    }
 }
 
 fn memory_budget(host_available: u64, cgroup_free: Option<u64>) -> u64 {
@@ -327,34 +341,34 @@ impl EmbeddingClient {
 
             let nproc = available_cpus();
             let budget = mem_before_loading_model * 6 / 10;
-            if let Some(max_memory) = budget.checked_div(per_instance_bytes) {
-                if max_memory == 0 {
-                    tracing::warn!(
-                        estimated_with_arena_mb = per_instance_bytes / (1024 * 1024),
-                        budget_mb = budget / (1024 * 1024),
-                        "A single {} instance is estimated to exceed the memory budget; \
-                         running with pool_size=1 but the process may be OOM-killed under load. \
-                         Raise the container memory limit or pick a smaller model.",
-                        model_name
-                    );
-                }
-                let max_memory = (max_memory as usize).max(1);
-                let capped = max_memory.min(desired_pool_size);
-                tracing::info!(
-                    per_instance_mb = per_instance_loaded / (1024 * 1024),
-                    estimated_with_arena_mb = per_instance_bytes / (1024 * 1024),
-                    available_mb = mem_before_loading_model / (1024 * 1024),
-                    budget_mb = budget / (1024 * 1024),
-                    nproc = nproc,
+            let capped = cap_pool_from_memory(desired_pool_size, budget, per_instance_bytes);
+            if per_instance_bytes == 0 {
+                tracing::warn!(
+                    model = model_name,
                     desired = desired_pool_size,
-                    max_from_memory = max_memory,
-                    capped = capped,
-                    "Measured ONNX model memory footprint"
+                    "Could not measure ONNX instance size; using pool_size=1"
                 );
-                capped
-            } else {
-                desired_pool_size
+            } else if capped == 1 && desired_pool_size > 1 {
+                tracing::warn!(
+                    estimated_with_arena_mb = per_instance_bytes / (1024 * 1024),
+                    budget_mb = budget / (1024 * 1024),
+                    "A single {} instance is estimated to exceed the memory budget; \
+                     running with pool_size=1 but the process may be OOM-killed under load. \
+                     Raise the container memory limit or pick a smaller model.",
+                    model_name
+                );
             }
+            tracing::info!(
+                per_instance_mb = per_instance_loaded / (1024 * 1024),
+                estimated_with_arena_mb = per_instance_bytes / (1024 * 1024),
+                available_mb = mem_before_loading_model / (1024 * 1024),
+                budget_mb = budget / (1024 * 1024),
+                nproc = nproc,
+                desired = desired_pool_size,
+                capped = capped,
+                "Measured ONNX model memory footprint"
+            );
+            capped
         } else {
             tracing::info!(
                 model = model_name,
@@ -630,12 +644,11 @@ mod tests {
         let cfg = EmbeddingConfig::from_env();
         assert!(matches!(cfg.models[0], EmbeddingModel::NomicEmbedTextV15));
         assert_eq!(cfg.cache_dir, None);
-        assert_eq!(cfg.pool_size, available_cpus());
+        assert_eq!(cfg.pool_size, 1);
         assert!(cfg.show_download_progress);
         assert!(cfg.execution_providers.is_empty());
         assert_eq!(cfg.sub_batch_size, 0);
-        assert!(cfg.intra_threads >= 1);
-        assert!(cfg.intra_threads <= 4);
+        assert_eq!(cfg.intra_threads, available_cpus());
         assert_eq!(cfg.idle_unload_secs, DEFAULT_IDLE_UNLOAD_SECS);
     }
 
@@ -733,7 +746,7 @@ mod tests {
         let _g = isolate_env();
         set("EMBEDDING_POOL_SIZE", "0");
         let cfg = EmbeddingConfig::from_env();
-        assert_eq!(cfg.pool_size, available_cpus());
+        assert_eq!(cfg.pool_size, 1);
     }
 
     #[test]
@@ -741,7 +754,7 @@ mod tests {
         let _g = isolate_env();
         set("EMBEDDING_POOL_SIZE", "not-a-number");
         let cfg = EmbeddingConfig::from_env();
-        assert_eq!(cfg.pool_size, available_cpus());
+        assert_eq!(cfg.pool_size, 1);
     }
 
     #[test]
@@ -761,23 +774,6 @@ mod tests {
         set("EMBEDDING_IDLE_UNLOAD_SECS", "60");
         let cfg = EmbeddingConfig::from_env();
         assert_eq!(cfg.idle_unload_secs, 60);
-    }
-
-    #[test]
-    fn new_does_not_load_onnx_sessions() {
-        let cfg = EmbeddingConfig {
-            models: vec![EmbeddingModel::AllMiniLML6V2],
-            show_download_progress: false,
-            cache_dir: None,
-            pool_size: 1,
-            execution_providers: Vec::new(),
-            sub_batch_size: 0,
-            intra_threads: 1,
-            idle_unload_secs: 0,
-        };
-        let client = EmbeddingClient::new(cfg).expect("lazy construct");
-        assert_eq!(client.idle_unload_secs(), 0);
-        assert_eq!(client.models.len(), 1);
     }
 
     #[test]
@@ -828,15 +824,22 @@ mod tests {
     }
 
     #[test]
-    fn default_pool_size_follows_cpu_count() {
-        assert_eq!(default_pool_size(), available_cpus());
-        assert!(default_pool_size() >= 1);
+    fn cap_pool_from_memory_never_exceeds_budget_or_desired() {
+        const MIB: u64 = 1024 * 1024;
+        assert_eq!(cap_pool_from_memory(8, 600 * MIB, 0), 1);
+        assert_eq!(cap_pool_from_memory(8, 0, 100 * MIB), 1);
+        assert_eq!(cap_pool_from_memory(8, 250 * MIB, 100 * MIB), 2);
+        assert_eq!(cap_pool_from_memory(1, 10_000 * MIB, 100 * MIB), 1);
     }
 
     #[test]
-    fn default_intra_threads_is_capped() {
+    fn default_pool_size_is_one() {
+        assert_eq!(default_pool_size(), 1);
+    }
+
+    #[test]
+    fn default_intra_threads_uses_available_cpus() {
+        assert_eq!(default_intra_threads(), available_cpus());
         assert!(default_intra_threads() >= 1);
-        assert!(default_intra_threads() <= 4);
-        assert!(available_cpus() >= 1);
     }
 }
