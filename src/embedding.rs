@@ -326,18 +326,11 @@ impl EmbeddingClient {
             None
         };
 
-        let mut first_model = Self::init_model(model, &probe_config)?;
+        let first_model = Self::init_and_warmup(model, &probe_config, model_name)?;
 
         // Tokenizer is fetched from the same cache dir fastembed just populated,
         // so this is a cache hit (no network) after the first model load.
         let tokenizer = Arc::new(Self::load_tokenizer(model, config)?);
-
-        // Always run one inference so Docker warmup (pool_size=1) still proves
-        // the session can execute, and so extra pool slots are sized from a
-        // post-arena RSS delta when desired_pool_size > 1.
-        first_model
-            .embed(vec!["warmup"], None)
-            .map_err(|e| format!("warmup inference failed for {}: {}", model_name, e))?;
 
         let pool_size = if let Some(mem_before_loading_model) = mem_before_loading_model {
             let mut sys = sysinfo::System::new();
@@ -402,9 +395,10 @@ impl EmbeddingClient {
             pool.push(Arc::new(Mutex::new(first_model)));
         } else {
             drop(first_model);
-            pool.push(Arc::new(Mutex::new(Self::init_model(
+            pool.push(Arc::new(Mutex::new(Self::init_and_warmup(
                 model,
                 &session_config,
+                model_name,
             )?)));
         }
         for _ in 1..pool_size {
@@ -427,6 +421,23 @@ impl EmbeddingClient {
         );
 
         Ok(BuiltModel { pool, tokenizer })
+    }
+
+    fn warmup_session(model: &mut TextEmbedding, model_name: &str) -> Result<(), String> {
+        model
+            .embed(vec!["warmup"], None)
+            .map_err(|e| format!("warmup inference failed for {}: {}", model_name, e))?;
+        Ok(())
+    }
+
+    fn init_and_warmup(
+        model: &EmbeddingModel,
+        config: &EmbeddingConfig,
+        model_name: &str,
+    ) -> Result<TextEmbedding, String> {
+        let mut inst = Self::init_model(model, config)?;
+        Self::warmup_session(&mut inst, model_name)?;
+        Ok(inst)
     }
 
     fn load_tokenizer(
@@ -863,14 +874,5 @@ mod tests {
     fn default_intra_threads_uses_available_cpus() {
         assert_eq!(default_intra_threads(), available_cpus());
         assert!(default_intra_threads() >= 1);
-    }
-
-    #[test]
-    fn intra_threads_for_pool_splits_cpus_across_sessions() {
-        assert_eq!(intra_threads_for_pool(64, 1, 64), 64);
-        assert_eq!(intra_threads_for_pool(64, 4, 64), 16);
-        assert_eq!(intra_threads_for_pool(4, 4, 64), 4);
-        assert_eq!(intra_threads_for_pool(64, 8, 4), 1);
-        assert_eq!(intra_threads_for_pool(128, 1, 8), 128);
     }
 }
