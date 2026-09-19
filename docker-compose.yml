@@ -4,7 +4,7 @@ services:
       context: .
       dockerfile: Dockerfile
       args:
-        EMBEDDING_MODELS: ${EMBEDDING_MODELS:-nomic,bge-small}
+        EMBEDDING_MODELS: ${EMBEDDING_MODELS:-nomic}
     image: embedding:latest
     container_name: embedding
     ports:

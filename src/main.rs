@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     Json, Router,
@@ -38,8 +39,15 @@ impl IntoResponse for AppError {
     }
 }
 
-async fn health() -> impl IntoResponse {
-    StatusCode::OK
+async fn health(State(state): State<AppState>) -> Response {
+    if let Some(err) = state.client.last_load_error() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": err })),
+        )
+            .into_response();
+    }
+    StatusCode::OK.into_response()
 }
 
 async fn embed(
@@ -81,7 +89,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .init();
 
     let config = EmbeddingConfig::from_env();
+    let idle_unload_secs = config.idle_unload_secs;
     let client = Arc::new(EmbeddingClient::new(config)?);
+
+    if idle_unload_secs > 0 {
+        let client_bg = client.clone();
+        let tick_secs = (idle_unload_secs / 6).clamp(10, 30);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(tick_secs));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            ticker.tick().await; // skip the immediate first tick
+            loop {
+                ticker.tick().await;
+                let client = client_bg.clone();
+                if let Err(err) = tokio::task::spawn_blocking(move || client.unload_idle()).await {
+                    tracing::warn!(error = %err, "idle unload task failed");
+                }
+            }
+        });
+        tracing::info!(idle_unload_secs, tick_secs, "idle model unload enabled");
+    }
+
     let state = AppState { client };
 
     let app = Router::new()
