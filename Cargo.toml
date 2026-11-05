@@ -8,6 +8,8 @@ axum = "0.8.7"
 fastembed = "5.15.0"
 futures = "0.3.32"
 hf-hub = "0.5.0"
+# Pinned to the ort fastembed uses so the CPU provider type matches.
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std"] }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.145"
 sysinfo = "0.39.2"
