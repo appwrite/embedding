@@ -889,14 +889,18 @@ mod tests {
     }
 
     #[test]
-    fn cpu_sessions_register_the_cpu_provider() {
+    fn cpu_sessions_disable_the_memory_arena() {
         let _g = isolate_env();
         let providers = execution_providers(&EmbeddingConfig::from_env());
         assert_eq!(providers.len(), 1);
-        let provider = format!("{:?}", providers[0]);
+        let cpu = providers[0]
+            .downcast_ref::<ort::ep::CPU>()
+            .expect("expected the CPU execution provider");
+        // `use_arena` is private, so read it through the derived Debug output.
+        let cpu = format!("{cpu:?}");
         assert!(
-            provider.starts_with("CPUExecutionProvider"),
-            "expected the CPU provider that disables the memory arena, got {provider}"
+            cpu.contains("use_arena: false"),
+            "expected the CPU memory arena to be disabled, got {cpu}"
         );
     }
 
