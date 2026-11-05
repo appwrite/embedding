@@ -1,0 +1,90 @@
+name: Memory benchmark
+
+on:
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bench:
+    name: memory before vs after
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Check out base
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: base
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: memory-bench
+
+      - name: Cache models
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: models
+          key: fastembed-models-nomic-v1
+
+      # Both builds share one target dir so dependencies compile once.
+      - name: Build base and head
+        run: |
+          mkdir -p bin
+          cargo build --release --manifest-path base/Cargo.toml --target-dir target --bin embedding
+          cp target/release/embedding bin/base
+          cargo build --release --bins
+          cp target/release/embedding bin/head
+
+      - name: Download model
+        run: target/release/warmup
+        env:
+          EMBEDDING_MODELS: nomic
+          EMBEDDING_CACHE_DIR: ${{ github.workspace }}/models
+
+      - name: Run benchmark
+        run: |
+          python3 scripts/bench_memory.py \
+            --base bin/base --head bin/head \
+            --cache-dir "$GITHUB_WORKSPACE/models" \
+            --out bench.md
+          {
+            echo "<!-- memory-bench -->"
+            echo "### Memory benchmark"
+            echo
+            echo "Base \`${BASE_SHA:0:7}\` vs head \`${HEAD_SHA:0:7}\` on \`ubuntu-latest\`."
+            echo
+            cat bench.md
+          } > comment.md
+          cat comment.md >> "$GITHUB_STEP_SUMMARY"
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+
+      # Fork PRs get a read-only token, so they only get the job summary.
+      - name: Comment on PR
+        if: github.event.pull_request.head.repo.full_name == github.repository
+        run: |
+          id=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
+            -q '.[] | select(.body | startswith("<!-- memory-bench -->")) | .id' | head -n1)
+          if [ -n "$id" ]; then
+            gh api -X PATCH "repos/$REPO/issues/comments/$id" -F body=@comment.md > /dev/null
+          else
+            gh pr comment "$PR" --repo "$REPO" --body-file comment.md
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
