@@ -47,6 +47,16 @@ fn default_pool_size() -> usize {
     1
 }
 
+/// The configured GPU providers, or the CPU provider with ONNX Runtime's
+/// memory arena disabled. The arena keeps the high-water mark of every input
+/// shape for the life of the session, so long texts pin gigabytes.
+fn execution_providers(config: &EmbeddingConfig) -> Vec<ExecutionProviderDispatch> {
+    if !config.execution_providers.is_empty() {
+        return config.execution_providers.clone();
+    }
+    vec![ort::ep::CPU::default().with_arena_allocator(false).build()]
+}
+
 fn default_intra_threads() -> usize {
     available_cpus()
 }
@@ -450,10 +460,9 @@ impl EmbeddingClient {
             let per_instance_loaded =
                 mem_before_loading_model.saturating_sub(memory_after_loading_model);
 
-            // ONNX Runtime uses arena allocation that grows with
-            // batch_size × sequence_length² (attention matrices) and is never
-            // released.  The warmup above only allocates a minimal arena for a
-            // single short text.  Apply a 3× multiplier to account for realistic
+            // Inference memory grows with batch_size × sequence_length²
+            // (attention matrices).  The warmup above only covers a single
+            // short text.  Apply a 3× multiplier to account for realistic
             // inference workloads (batch=8-32 texts of 1000-2000 tokens each).
             let per_instance_bytes = per_instance_loaded.saturating_mul(3);
 
@@ -585,10 +594,7 @@ impl EmbeddingClient {
             init_options = init_options.with_cache_dir(cache_dir.into());
         }
 
-        if !config.execution_providers.is_empty() {
-            init_options =
-                init_options.with_execution_providers(config.execution_providers.clone());
-        }
+        init_options = init_options.with_execution_providers(execution_providers(config));
 
         TextEmbedding::try_new(init_options)
             .map_err(|e| format!("Failed to initialize embedding model: {}", e))
@@ -880,6 +886,22 @@ mod tests {
         set("EMBEDDING_CACHE_DIR", "/tmp/embedding-cache");
         let cfg = EmbeddingConfig::from_env();
         assert_eq!(cfg.cache_dir.as_deref(), Some("/tmp/embedding-cache"));
+    }
+
+    #[test]
+    fn cpu_sessions_disable_the_memory_arena() {
+        let _g = isolate_env();
+        let providers = execution_providers(&EmbeddingConfig::from_env());
+        assert_eq!(providers.len(), 1);
+        let cpu = providers[0]
+            .downcast_ref::<ort::ep::CPU>()
+            .expect("expected the CPU execution provider");
+        // `use_arena` is private, so read it through the derived Debug output.
+        let cpu = format!("{cpu:?}");
+        assert!(
+            cpu.contains("use_arena: false"),
+            "expected the CPU memory arena to be disabled, got {cpu}"
+        );
     }
 
     #[test]

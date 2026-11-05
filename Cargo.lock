@@ -589,6 +589,7 @@ dependencies = [
  "fastembed",
  "futures",
  "hf-hub",
+ "ort",
  "serde",
  "serde_json",
  "sysinfo",
@@ -597,6 +598,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "ureq",
 ]
 
 [[package]]
