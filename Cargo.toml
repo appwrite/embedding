@@ -20,3 +20,7 @@ tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = { version = "0.6", features = ["override_allocator_on_supported_platforms"] }
+
+[dev-dependencies]
+# HTTP client for examples/bench_memory.rs; already in the tree via hf-hub.
+ureq = { version = "3.3.0", default-features = false }
