@@ -17,6 +17,12 @@ pub const DEFAULT_IDLE_UNLOAD_SECS: u64 = 300;
 /// After a failed load, skip another download/init for this long.
 const LOAD_RETRY_SECS: u64 = 30;
 
+/// Upper bound on tokens per text, whatever the model supports. Longer texts
+/// are rejected.
+/// One text at 4096 tokens peaks near 3 GB and memory grows with the square of
+/// the length, so nomic's full 8192 cannot run in a typical container.
+pub const DEFAULT_MAX_TOKENS: usize = 2048;
+
 #[derive(Debug, Clone)]
 pub struct EmbeddingResult {
     pub model: String,
@@ -35,6 +41,7 @@ pub struct EmbeddingConfig {
     pub sub_batch_size: usize,
     pub intra_threads: usize,
     pub idle_unload_secs: u64,
+    pub max_tokens: usize,
 }
 
 fn available_cpus() -> usize {
@@ -119,6 +126,15 @@ pub(crate) fn should_unload(last_access: u64, now: u64, idle_unload_secs: u64) -
         && now.saturating_sub(last_access) >= idle_unload_secs.saturating_mul(1000)
 }
 
+/// Index and token count of the first text longer than `max_length`.
+fn first_over_limit(counts: &[usize], max_length: usize) -> Option<(usize, usize)> {
+    counts
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|&(_, count)| count > max_length)
+}
+
 fn parse_usize_env(key: &str) -> Option<usize> {
     std::env::var(key)
         .ok()
@@ -156,6 +172,10 @@ impl EmbeddingConfig {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(DEFAULT_IDLE_UNLOAD_SECS);
 
+        let max_tokens = parse_usize_env("EMBEDDING_MAX_TOKENS")
+            .filter(|&n| n >= 1)
+            .unwrap_or(DEFAULT_MAX_TOKENS);
+
         Self {
             models,
             show_download_progress: true,
@@ -165,7 +185,13 @@ impl EmbeddingConfig {
             sub_batch_size: 0,
             intra_threads,
             idle_unload_secs,
+            max_tokens,
         }
+    }
+
+    /// Tokens embedded per text for `model`.
+    fn max_length(&self, model: &EmbeddingModel) -> usize {
+        model::context_length(model).min(self.max_tokens)
     }
 }
 
@@ -182,7 +208,7 @@ struct LoadedModel {
     next: AtomicUsize,
     load: Mutex<()>,
     inner: Mutex<ModelSlot>,
-    dimension: usize,
+    max_length: usize,
     last_access: AtomicU64,
     in_flight: AtomicUsize,
     last_failure: Mutex<Option<LoadFailure>>,
@@ -232,7 +258,7 @@ impl EmbeddingClient {
                         pool: None,
                         tokenizer: None,
                     }),
-                    dimension: model::dimension(model),
+                    max_length: config.max_length(model),
                     last_access: AtomicU64::new(0),
                     in_flight: AtomicUsize::new(0),
                     last_failure: Mutex::new(None),
@@ -578,7 +604,15 @@ impl EmbeddingClient {
         let path = repo
             .get("tokenizer.json")
             .map_err(|e| format!("fetch tokenizer.json: {}", e))?;
-        Tokenizer::from_file(&path).map_err(|e| format!("parse tokenizer.json: {}", e))
+        let mut tokenizer =
+            Tokenizer::from_file(&path).map_err(|e| format!("parse tokenizer.json: {}", e))?;
+        // Count every input token: some tokenizer.json files turn on truncation
+        // and padding, which would hide input over the limit.
+        tokenizer
+            .with_truncation(None)
+            .map_err(|e| format!("configure tokenizer: {}", e))?;
+        tokenizer.with_padding(None);
+        Ok(tokenizer)
     }
 
     fn init_model(
@@ -587,6 +621,7 @@ impl EmbeddingClient {
         intra_threads: usize,
     ) -> Result<TextEmbedding, String> {
         let mut init_options = InitOptions::new(model.clone())
+            .with_max_length(config.max_length(model))
             .with_show_download_progress(config.show_download_progress)
             .with_intra_threads(intra_threads);
 
@@ -652,6 +687,25 @@ impl EmbeddingClient {
             counter: &loaded.in_flight,
         };
 
+        let tokenizer = self.tokenizer(loaded).await?;
+        let owned_texts: Vec<String> = texts.iter().map(|t| t.to_string()).collect();
+        let counts = tokio::task::spawn_blocking(move || -> Result<Vec<usize>, String> {
+            let encodings = tokenizer
+                .encode_batch(owned_texts, true)
+                .map_err(|e| format!("tokenize: {}", e))?;
+            Ok(encodings.iter().map(|e| e.get_ids().len()).collect())
+        })
+        .await
+        .map_err(|e| format!("Failed to join tokenizer task: {}", e))??;
+
+        if let Some((index, count)) = first_over_limit(&counts, loaded.max_length) {
+            return Err(EmbedError::TooLong(format!(
+                "text at index {} has {} tokens, the limit for {} is {}",
+                index, count, model_name, loaded.max_length
+            )));
+        }
+        let tokens = counts.iter().sum();
+
         let sub_batch = if self.sub_batch_override > 0 {
             self.sub_batch_override
         } else {
@@ -661,7 +715,7 @@ impl EmbeddingClient {
                 sys.available_memory(),
                 sys.cgroup_limits().map(|limits| limits.free_memory),
             ) / (1024 * 1024);
-            Self::compute_sub_batch(available_mb, loaded.dimension, self.gpu)
+            Self::compute_sub_batch(available_mb, loaded.max_length, self.gpu)
         };
 
         // Each chunk runs in spawn_blocking so ORT inference does not occupy
@@ -689,17 +743,6 @@ impl EmbeddingClient {
             embeddings.append(&mut batch_result);
         }
 
-        let tokenizer = self.tokenizer(loaded).await?;
-        let owned_texts: Vec<String> = texts.iter().map(|t| t.to_string()).collect();
-        let tokens = tokio::task::spawn_blocking(move || -> Result<usize, String> {
-            let encodings = tokenizer
-                .encode_batch(owned_texts, true)
-                .map_err(|e| format!("tokenize: {}", e))?;
-            Ok(encodings.iter().map(|e| e.get_ids().len()).sum())
-        })
-        .await
-        .map_err(|e| format!("Failed to join tokenizer task: {}", e))??;
-
         touch_access(loaded);
 
         Ok(EmbeddingResult {
@@ -716,13 +759,12 @@ impl EmbeddingClient {
     /// When GPU is enabled, the upper clamp is raised to 256 (GPU VRAM can
     /// handle much larger batches than CPU).
     /// TODO: add here the config batch size
-    fn compute_sub_batch(available_mb: u64, dimension: usize, gpu: bool) -> usize {
-        // Per-text memory estimate for ONNX inference.  Attention matrices
-        // dominate: heads × seq² × 4 bytes.  For 768-dim BERT-like models
-        // (12 heads) processing ~1000-2000 token code chunks, attention alone
-        // is 50-200 MB per text.  The estimate below is conservative so the
-        // sub-batch stays small enough to prevent arena over-allocation.
-        let mb_per_text: u64 = if dimension >= 768 { 100 } else { 40 };
+    fn compute_sub_batch(available_mb: u64, max_length: usize, gpu: bool) -> usize {
+        // Peak memory per text for ONNX inference. Attention matrices dominate
+        // and grow with seq². Fitted just above nomic on CPU: 86 MB at 512
+        // tokens, 206 MB at 1024, 591 MB at 2048 and 2.4 GB at 4096.
+        let max_length = max_length as u64;
+        let mb_per_text = 50 + max_length * max_length / 6_500;
         let budget_mb = available_mb / 2;
         let max_batch = if gpu { 256 } else { 16 };
         (budget_mb / mb_per_text).clamp(1, max_batch) as usize
@@ -736,12 +778,13 @@ mod tests {
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    const ENV_KEYS: [&str; 5] = [
+    const ENV_KEYS: [&str; 6] = [
         "EMBEDDING_MODELS",
         "EMBEDDING_CACHE_DIR",
         "EMBEDDING_POOL_SIZE",
         "EMBEDDING_INTRA_THREADS",
         "EMBEDDING_IDLE_UNLOAD_SECS",
+        "EMBEDDING_MAX_TOKENS",
     ];
 
     /// Holds the env mutex and restores the original values on drop. Tests that
@@ -948,6 +991,23 @@ mod tests {
     }
 
     #[test]
+    fn max_length_is_the_context_length_capped_by_max_tokens() {
+        let _g = isolate_env();
+        let config = EmbeddingConfig::from_env();
+        assert_eq!(config.max_tokens, DEFAULT_MAX_TOKENS);
+        assert_eq!(config.max_length(&EmbeddingModel::NomicEmbedTextV15), 2048);
+        assert_eq!(config.max_length(&EmbeddingModel::AllMiniLML6V2), 256);
+
+        set("EMBEDDING_MAX_TOKENS", "8192");
+        let config = EmbeddingConfig::from_env();
+        assert_eq!(config.max_length(&EmbeddingModel::NomicEmbedTextV15), 8192);
+        assert_eq!(config.max_length(&EmbeddingModel::EmbeddingGemma300M), 2048);
+
+        set("EMBEDDING_MAX_TOKENS", "0");
+        assert_eq!(EmbeddingConfig::from_env().max_tokens, DEFAULT_MAX_TOKENS);
+    }
+
+    #[test]
     fn should_unload_requires_prior_use_and_timeout() {
         assert!(!should_unload(0, 1_000, 300));
         assert!(!should_unload(900_000, 1_000_000, 0));
@@ -957,17 +1017,30 @@ mod tests {
 
     #[test]
     fn compute_sub_batch_shrinks_to_fit_small_budgets() {
-        assert_eq!(EmbeddingClient::compute_sub_batch(0, 768, false), 1);
-        // 200 MiB free -> 100 MiB budget -> one 100 MiB text, not four.
-        assert_eq!(EmbeddingClient::compute_sub_batch(200, 768, false), 1);
+        assert_eq!(EmbeddingClient::compute_sub_batch(0, 2048, false), 1);
+        // 200 MiB free -> 100 MiB budget -> never less than one text.
+        assert_eq!(EmbeddingClient::compute_sub_batch(200, 2048, false), 1);
         assert_eq!(
-            EmbeddingClient::compute_sub_batch(64 * 1024, 768, false),
+            EmbeddingClient::compute_sub_batch(64 * 1024, 512, false),
             16
         );
         assert_eq!(
-            EmbeddingClient::compute_sub_batch(64 * 1024, 768, true),
+            EmbeddingClient::compute_sub_batch(64 * 1024, 512, true),
             256
         );
+    }
+
+    #[test]
+    fn first_over_limit_allows_text_at_the_limit() {
+        assert_eq!(first_over_limit(&[10, 64], 64), None);
+        assert_eq!(first_over_limit(&[10, 65, 70], 64), Some((1, 65)));
+    }
+
+    #[test]
+    fn compute_sub_batch_shrinks_as_max_length_grows() {
+        assert_eq!(EmbeddingClient::compute_sub_batch(4096, 512, false), 16);
+        assert_eq!(EmbeddingClient::compute_sub_batch(4096, 2048, false), 2);
+        assert_eq!(EmbeddingClient::compute_sub_batch(4096, 8192, false), 1);
     }
 
     #[test]

@@ -1,13 +1,16 @@
 #[derive(Debug)]
 pub enum EmbedError {
     UnknownModel(String),
+    TooLong(String),
     Internal(String),
 }
 
 impl std::fmt::Display for EmbedError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            EmbedError::UnknownModel(m) | EmbedError::Internal(m) => write!(f, "{}", m),
+            EmbedError::UnknownModel(m) | EmbedError::TooLong(m) | EmbedError::Internal(m) => {
+                write!(f, "{}", m)
+            }
         }
     }
 }

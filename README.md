@@ -30,6 +30,7 @@ Configured via environment variables (set them in `.env`):
 | `EMBEDDING_POOL_SIZE` | `1` | Number of ONNX sessions per model while it is loaded, then capped by available RAM. Concurrent `/embed` calls round-robin across sessions. Raise this for parallel HTTP throughput; each extra session keeps another copy of the weights resident until idle unload. |
 | `EMBEDDING_INTRA_THREADS` | CPU count | ONNX Runtime intra-op threads per session. The default uses the whole machine on the single default session. When `EMBEDDING_POOL_SIZE` is greater than one, threads are split across sessions (`nproc / pool_size`, still capped by this value) so concurrent embeds do not oversubscribe the host. |
 | `EMBEDDING_IDLE_UNLOAD_SECS` | `300` | Drop a model's sessions this many seconds after last use (`0` disables). The next `/embed` reloads the same checkpoint from `EMBEDDING_CACHE_DIR`. |
+| `EMBEDDING_MAX_TOKENS` | `2048` | Most tokens allowed per text; longer input is rejected with `400`. Each model also has its own limit: `nomic` 8192, `embedding-gemma` 2048, `bge-small` 512, `all-minilm` 256. Memory grows with the square of this value: one nomic text peaks near 1.2 GB at 2048 and 3 GB at 4096, and 8192 did not fit in 5 GB. |
 
 ## API
 
@@ -53,6 +54,6 @@ Response:
 
 Errors:
 
-- `400 Bad Request` — `texts` is empty or the model alias is not in `EMBEDDING_MODELS`.
+- `400 Bad Request` — `texts` is empty, the model alias is not in `EMBEDDING_MODELS`, or a text is over the token limit. Split long input before sending it.
 - `500 Internal Server Error` — embedding or tokenizer failure (message in `error` field).
 - `503 Service Unavailable` — `GET /health` for 30 seconds after a model load has failed (message in `error` field).

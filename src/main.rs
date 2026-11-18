@@ -67,7 +67,9 @@ async fn embed(
         .embed(&req.model, &refs)
         .await
         .map_err(|e| match e {
-            EmbedError::UnknownModel(msg) => AppError(StatusCode::BAD_REQUEST, msg),
+            EmbedError::UnknownModel(msg) | EmbedError::TooLong(msg) => {
+                AppError(StatusCode::BAD_REQUEST, msg)
+            }
             EmbedError::Internal(msg) => AppError(StatusCode::INTERNAL_SERVER_ERROR, msg),
         })?;
 
