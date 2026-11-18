@@ -12,6 +12,7 @@ fn small_model_config(pool_size: usize) -> EmbeddingConfig {
         sub_batch_size: 0,
         intra_threads: 1,
         idle_unload_secs: 0,
+        max_tokens: 2048,
     }
 }
 
@@ -25,6 +26,7 @@ fn nomic_config() -> EmbeddingConfig {
         sub_batch_size: 0,
         intra_threads: 1,
         idle_unload_secs: 0,
+        max_tokens: 2048,
     }
 }
 

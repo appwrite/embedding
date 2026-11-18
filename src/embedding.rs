@@ -9,13 +9,18 @@ use std::sync::{
     atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
-use tokenizers::Tokenizer;
+use tokenizers::{Tokenizer, TruncationParams};
 
 /// Unload a model this many seconds after last use. `0` disables unloading.
 pub const DEFAULT_IDLE_UNLOAD_SECS: u64 = 300;
 
 /// After a failed load, skip another download/init for this long.
 const LOAD_RETRY_SECS: u64 = 30;
+
+/// Upper bound on tokens embedded per text, whatever the model supports.
+/// One text at 4096 tokens peaks near 3 GB and memory grows with the square of
+/// the length, so nomic's full 8192 cannot run in a typical container.
+pub const DEFAULT_MAX_TOKENS: usize = 2048;
 
 #[derive(Debug, Clone)]
 pub struct EmbeddingResult {
@@ -35,6 +40,7 @@ pub struct EmbeddingConfig {
     pub sub_batch_size: usize,
     pub intra_threads: usize,
     pub idle_unload_secs: u64,
+    pub max_tokens: usize,
 }
 
 fn available_cpus() -> usize {
@@ -156,6 +162,10 @@ impl EmbeddingConfig {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(DEFAULT_IDLE_UNLOAD_SECS);
 
+        let max_tokens = parse_usize_env("EMBEDDING_MAX_TOKENS")
+            .filter(|&n| n >= 1)
+            .unwrap_or(DEFAULT_MAX_TOKENS);
+
         Self {
             models,
             show_download_progress: true,
@@ -165,7 +175,13 @@ impl EmbeddingConfig {
             sub_batch_size: 0,
             intra_threads,
             idle_unload_secs,
+            max_tokens,
         }
+    }
+
+    /// Tokens embedded per text for `model`.
+    fn max_length(&self, model: &EmbeddingModel) -> usize {
+        model::context_length(model).min(self.max_tokens)
     }
 }
 
@@ -183,6 +199,7 @@ struct LoadedModel {
     load: Mutex<()>,
     inner: Mutex<ModelSlot>,
     dimension: usize,
+    max_length: usize,
     last_access: AtomicU64,
     in_flight: AtomicUsize,
     last_failure: Mutex<Option<LoadFailure>>,
@@ -233,6 +250,7 @@ impl EmbeddingClient {
                         tokenizer: None,
                     }),
                     dimension: model::dimension(model),
+                    max_length: config.max_length(model),
                     last_access: AtomicU64::new(0),
                     in_flight: AtomicUsize::new(0),
                     last_failure: Mutex::new(None),
@@ -578,7 +596,18 @@ impl EmbeddingClient {
         let path = repo
             .get("tokenizer.json")
             .map_err(|e| format!("fetch tokenizer.json: {}", e))?;
-        Tokenizer::from_file(&path).map_err(|e| format!("parse tokenizer.json: {}", e))
+        let mut tokenizer =
+            Tokenizer::from_file(&path).map_err(|e| format!("parse tokenizer.json: {}", e))?;
+        // Count what the model embeds: cut where it cuts, and leave out the
+        // padding some tokenizer.json files turn on.
+        tokenizer
+            .with_truncation(Some(TruncationParams {
+                max_length: config.max_length(model),
+                ..Default::default()
+            }))
+            .map_err(|e| format!("truncate tokenizer: {}", e))?;
+        tokenizer.with_padding(None);
+        Ok(tokenizer)
     }
 
     fn init_model(
@@ -587,6 +616,7 @@ impl EmbeddingClient {
         intra_threads: usize,
     ) -> Result<TextEmbedding, String> {
         let mut init_options = InitOptions::new(model.clone())
+            .with_max_length(config.max_length(model))
             .with_show_download_progress(config.show_download_progress)
             .with_intra_threads(intra_threads);
 
@@ -736,12 +766,13 @@ mod tests {
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    const ENV_KEYS: [&str; 5] = [
+    const ENV_KEYS: [&str; 6] = [
         "EMBEDDING_MODELS",
         "EMBEDDING_CACHE_DIR",
         "EMBEDDING_POOL_SIZE",
         "EMBEDDING_INTRA_THREADS",
         "EMBEDDING_IDLE_UNLOAD_SECS",
+        "EMBEDDING_MAX_TOKENS",
     ];
 
     /// Holds the env mutex and restores the original values on drop. Tests that
@@ -945,6 +976,23 @@ mod tests {
         set("EMBEDDING_IDLE_UNLOAD_SECS", "60");
         let cfg = EmbeddingConfig::from_env();
         assert_eq!(cfg.idle_unload_secs, 60);
+    }
+
+    #[test]
+    fn max_length_is_the_context_length_capped_by_max_tokens() {
+        let _g = isolate_env();
+        let config = EmbeddingConfig::from_env();
+        assert_eq!(config.max_tokens, DEFAULT_MAX_TOKENS);
+        assert_eq!(config.max_length(&EmbeddingModel::NomicEmbedTextV15), 2048);
+        assert_eq!(config.max_length(&EmbeddingModel::AllMiniLML6V2), 256);
+
+        set("EMBEDDING_MAX_TOKENS", "8192");
+        let config = EmbeddingConfig::from_env();
+        assert_eq!(config.max_length(&EmbeddingModel::NomicEmbedTextV15), 8192);
+        assert_eq!(config.max_length(&EmbeddingModel::EmbeddingGemma300M), 2048);
+
+        set("EMBEDDING_MAX_TOKENS", "0");
+        assert_eq!(EmbeddingConfig::from_env().max_tokens, DEFAULT_MAX_TOKENS);
     }
 
     #[test]
