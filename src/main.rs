@@ -31,7 +31,13 @@ struct EmbedResponse {
     total_duration: u64,
 }
 
-struct AppError(StatusCode, String);
+struct AppError(StatusCode, serde_json::Value);
+
+impl AppError {
+    fn new(status: StatusCode, message: String) -> Self {
+        Self(status, message.into())
+    }
+}
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
@@ -55,23 +61,35 @@ async fn embed(
     Json(req): Json<EmbedRequest>,
 ) -> Result<Json<EmbedResponse>, AppError> {
     if req.texts.is_empty() {
-        return Err(AppError(
+        return Err(AppError::new(
             StatusCode::BAD_REQUEST,
             "texts must not be empty".to_string(),
         ));
     }
 
     let refs: Vec<&str> = req.texts.iter().map(|s| s.as_str()).collect();
-    let result = state
-        .client
-        .embed(&req.model, &refs)
-        .await
-        .map_err(|e| match e {
-            EmbedError::UnknownModel(msg) | EmbedError::TooLong(msg) => {
-                AppError(StatusCode::BAD_REQUEST, msg)
-            }
-            EmbedError::Internal(msg) => AppError(StatusCode::INTERNAL_SERVER_ERROR, msg),
-        })?;
+    let result = state.client.embed(&req.model, &refs).await.map_err(|e| {
+        let message = e.to_string();
+        match e {
+            EmbedError::UnknownModel(msg) => AppError::new(StatusCode::BAD_REQUEST, msg),
+            EmbedError::TooLong {
+                index,
+                tokens,
+                limit,
+                ..
+            } => AppError(
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({
+                    "type": "text_too_long",
+                    "message": message,
+                    "index": index,
+                    "tokens": tokens,
+                    "limit": limit,
+                }),
+            ),
+            EmbedError::Internal(msg) => AppError::new(StatusCode::INTERNAL_SERVER_ERROR, msg),
+        }
+    })?;
 
     Ok(Json(EmbedResponse {
         model: result.model,

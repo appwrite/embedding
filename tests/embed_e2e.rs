@@ -217,7 +217,7 @@ async fn nomic_rejects_text_over_max_length() {
         .await
         .expect_err("text over the limit should be rejected");
 
-    assert!(matches!(err, EmbedError::TooLong(_)));
+    assert!(matches!(err, EmbedError::TooLong { .. }));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -230,7 +230,7 @@ async fn minilm_rejects_text_over_its_context() {
         .await
         .expect_err("text over the model context should be rejected");
 
-    assert!(matches!(err, EmbedError::TooLong(_)));
+    assert!(matches!(err, EmbedError::TooLong { .. }));
 }
 
 #[tokio::test(flavor = "multi_thread")]

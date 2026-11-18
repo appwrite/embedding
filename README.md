@@ -54,6 +54,6 @@ Response:
 
 Errors:
 
-- `400 Bad Request` — `texts` is empty, the model alias is not in `EMBEDDING_MODELS`, or a text is over the token limit. Split long input before sending it.
+- `400 Bad Request` — `texts` is empty, the model alias is not in `EMBEDDING_MODELS`, or a text is over the token limit. Split long input before sending it. Over the limit, `error` is an object: `{"type":"text_too_long","message":"...","index":1,"tokens":20002,"limit":2048}`.
 - `500 Internal Server Error` — embedding or tokenizer failure (message in `error` field).
 - `503 Service Unavailable` — `GET /health` for 30 seconds after a model load has failed (message in `error` field).

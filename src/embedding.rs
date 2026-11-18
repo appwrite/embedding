@@ -699,10 +699,12 @@ impl EmbeddingClient {
         .map_err(|e| format!("Failed to join tokenizer task: {}", e))??;
 
         if let Some((index, count)) = first_over_limit(&counts, loaded.max_length) {
-            return Err(EmbedError::TooLong(format!(
-                "text at index {} has {} tokens, the limit for {} is {}",
-                index, count, model_name, loaded.max_length
-            )));
+            return Err(EmbedError::TooLong {
+                model: model_name.to_owned(),
+                index,
+                tokens: count,
+                limit: loaded.max_length,
+            });
         }
         let tokens = counts.iter().sum();
 
