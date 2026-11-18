@@ -198,7 +198,6 @@ struct LoadedModel {
     next: AtomicUsize,
     load: Mutex<()>,
     inner: Mutex<ModelSlot>,
-    dimension: usize,
     max_length: usize,
     last_access: AtomicU64,
     in_flight: AtomicUsize,
@@ -249,7 +248,6 @@ impl EmbeddingClient {
                         pool: None,
                         tokenizer: None,
                     }),
-                    dimension: model::dimension(model),
                     max_length: config.max_length(model),
                     last_access: AtomicU64::new(0),
                     in_flight: AtomicUsize::new(0),
@@ -691,7 +689,7 @@ impl EmbeddingClient {
                 sys.available_memory(),
                 sys.cgroup_limits().map(|limits| limits.free_memory),
             ) / (1024 * 1024);
-            Self::compute_sub_batch(available_mb, loaded.dimension, self.gpu)
+            Self::compute_sub_batch(available_mb, loaded.max_length, self.gpu)
         };
 
         // Each chunk runs in spawn_blocking so ORT inference does not occupy
@@ -746,13 +744,12 @@ impl EmbeddingClient {
     /// When GPU is enabled, the upper clamp is raised to 256 (GPU VRAM can
     /// handle much larger batches than CPU).
     /// TODO: add here the config batch size
-    fn compute_sub_batch(available_mb: u64, dimension: usize, gpu: bool) -> usize {
-        // Per-text memory estimate for ONNX inference.  Attention matrices
-        // dominate: heads × seq² × 4 bytes.  For 768-dim BERT-like models
-        // (12 heads) processing ~1000-2000 token code chunks, attention alone
-        // is 50-200 MB per text.  The estimate below is conservative so the
-        // sub-batch stays small enough to prevent arena over-allocation.
-        let mb_per_text: u64 = if dimension >= 768 { 100 } else { 40 };
+    fn compute_sub_batch(available_mb: u64, max_length: usize, gpu: bool) -> usize {
+        // Peak memory per text for ONNX inference. Attention matrices dominate
+        // and grow with seq². Fitted just above nomic on CPU: 86 MB at 512
+        // tokens, 206 MB at 1024, 591 MB at 2048 and 2.4 GB at 4096.
+        let max_length = max_length as u64;
+        let mb_per_text = 50 + max_length * max_length / 6_500;
         let budget_mb = available_mb / 2;
         let max_batch = if gpu { 256 } else { 16 };
         (budget_mb / mb_per_text).clamp(1, max_batch) as usize
@@ -1005,17 +1002,24 @@ mod tests {
 
     #[test]
     fn compute_sub_batch_shrinks_to_fit_small_budgets() {
-        assert_eq!(EmbeddingClient::compute_sub_batch(0, 768, false), 1);
-        // 200 MiB free -> 100 MiB budget -> one 100 MiB text, not four.
-        assert_eq!(EmbeddingClient::compute_sub_batch(200, 768, false), 1);
+        assert_eq!(EmbeddingClient::compute_sub_batch(0, 2048, false), 1);
+        // 200 MiB free -> 100 MiB budget -> never less than one text.
+        assert_eq!(EmbeddingClient::compute_sub_batch(200, 2048, false), 1);
         assert_eq!(
-            EmbeddingClient::compute_sub_batch(64 * 1024, 768, false),
+            EmbeddingClient::compute_sub_batch(64 * 1024, 512, false),
             16
         );
         assert_eq!(
-            EmbeddingClient::compute_sub_batch(64 * 1024, 768, true),
+            EmbeddingClient::compute_sub_batch(64 * 1024, 512, true),
             256
         );
+    }
+
+    #[test]
+    fn compute_sub_batch_shrinks_as_max_length_grows() {
+        assert_eq!(EmbeddingClient::compute_sub_batch(4096, 512, false), 16);
+        assert_eq!(EmbeddingClient::compute_sub_batch(4096, 2048, false), 2);
+        assert_eq!(EmbeddingClient::compute_sub_batch(4096, 8192, false), 1);
     }
 
     #[test]
