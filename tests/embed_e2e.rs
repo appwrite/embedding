@@ -189,3 +189,54 @@ async fn nomic_embed_is_768d_and_ranks_similar_text_higher() {
         "related sentences should rank above an unrelated one: similar={similar} dissimilar={dissimilar}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "downloads the NomicEmbedTextV15 ONNX model on first run"]
+async fn nomic_embeds_text_past_512_tokens() {
+    let client = EmbeddingClient::new(nomic_config()).expect("client init");
+    let prefix = "fox ".repeat(600);
+    let cats = format!("{prefix}cats cats cats cats");
+    let quantum = format!("{prefix}quantum quantum quantum quantum");
+    let result = client
+        .embed("nomic", &[cats.as_str(), quantum.as_str()])
+        .await
+        .expect("nomic embed should succeed");
+
+    assert_ne!(result.embeddings[0], result.embeddings[1]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "downloads the NomicEmbedTextV15 ONNX model on first run"]
+async fn nomic_tokens_stop_at_max_length() {
+    let mut cfg = nomic_config();
+    cfg.max_tokens = 64;
+    let client = EmbeddingClient::new(cfg).expect("client init");
+    let long = "word ".repeat(20_000);
+    let result = client
+        .embed("nomic", &[long.as_str(), long.as_str()])
+        .await
+        .expect("nomic embed should succeed");
+
+    assert_eq!(result.tokens, 2 * 64);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "downloads the AllMiniLML6V2 ONNX model on first run"]
+async fn tokens_leave_out_padding() {
+    let client = EmbeddingClient::new(small_model_config(1)).expect("client init");
+    let alone = client
+        .embed("minilm", &["hi"])
+        .await
+        .expect("embed should succeed");
+    let long = "word ".repeat(100);
+    let long_alone = client
+        .embed("minilm", &[long.as_str()])
+        .await
+        .expect("embed should succeed");
+    let batch = client
+        .embed("minilm", &["hi", long.as_str()])
+        .await
+        .expect("embed should succeed");
+
+    assert_eq!(batch.tokens, alone.tokens + long_alone.tokens);
+}
