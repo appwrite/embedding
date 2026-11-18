@@ -9,7 +9,7 @@ use std::sync::{
     atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
-use tokenizers::{Tokenizer, TruncationParams};
+use tokenizers::Tokenizer;
 
 /// Unload a model this many seconds after last use. `0` disables unloading.
 pub const DEFAULT_IDLE_UNLOAD_SECS: u64 = 300;
@@ -17,7 +17,8 @@ pub const DEFAULT_IDLE_UNLOAD_SECS: u64 = 300;
 /// After a failed load, skip another download/init for this long.
 const LOAD_RETRY_SECS: u64 = 30;
 
-/// Upper bound on tokens embedded per text, whatever the model supports.
+/// Upper bound on tokens per text, whatever the model supports. Longer texts
+/// are rejected.
 /// One text at 4096 tokens peaks near 3 GB and memory grows with the square of
 /// the length, so nomic's full 8192 cannot run in a typical container.
 pub const DEFAULT_MAX_TOKENS: usize = 2048;
@@ -123,6 +124,15 @@ pub(crate) fn should_unload(last_access: u64, now: u64, idle_unload_secs: u64) -
     idle_unload_secs > 0
         && last_access > 0
         && now.saturating_sub(last_access) >= idle_unload_secs.saturating_mul(1000)
+}
+
+/// Index and token count of the first text longer than `max_length`.
+fn first_over_limit(counts: &[usize], max_length: usize) -> Option<(usize, usize)> {
+    counts
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|&(_, count)| count > max_length)
 }
 
 fn parse_usize_env(key: &str) -> Option<usize> {
@@ -596,14 +606,11 @@ impl EmbeddingClient {
             .map_err(|e| format!("fetch tokenizer.json: {}", e))?;
         let mut tokenizer =
             Tokenizer::from_file(&path).map_err(|e| format!("parse tokenizer.json: {}", e))?;
-        // Count what the model embeds: cut where it cuts, and leave out the
-        // padding some tokenizer.json files turn on.
+        // Count every input token: some tokenizer.json files turn on truncation
+        // and padding, which would hide input over the limit.
         tokenizer
-            .with_truncation(Some(TruncationParams {
-                max_length: config.max_length(model),
-                ..Default::default()
-            }))
-            .map_err(|e| format!("truncate tokenizer: {}", e))?;
+            .with_truncation(None)
+            .map_err(|e| format!("configure tokenizer: {}", e))?;
         tokenizer.with_padding(None);
         Ok(tokenizer)
     }
@@ -680,6 +687,25 @@ impl EmbeddingClient {
             counter: &loaded.in_flight,
         };
 
+        let tokenizer = self.tokenizer(loaded).await?;
+        let owned_texts: Vec<String> = texts.iter().map(|t| t.to_string()).collect();
+        let counts = tokio::task::spawn_blocking(move || -> Result<Vec<usize>, String> {
+            let encodings = tokenizer
+                .encode_batch(owned_texts, true)
+                .map_err(|e| format!("tokenize: {}", e))?;
+            Ok(encodings.iter().map(|e| e.get_ids().len()).collect())
+        })
+        .await
+        .map_err(|e| format!("Failed to join tokenizer task: {}", e))??;
+
+        if let Some((index, count)) = first_over_limit(&counts, loaded.max_length) {
+            return Err(EmbedError::TooLong(format!(
+                "text at index {} has {} tokens, the limit for {} is {}",
+                index, count, model_name, loaded.max_length
+            )));
+        }
+        let tokens = counts.iter().sum();
+
         let sub_batch = if self.sub_batch_override > 0 {
             self.sub_batch_override
         } else {
@@ -716,17 +742,6 @@ impl EmbeddingClient {
                 .map_err(|e| format!("Failed to join embedding task: {}", e))??;
             embeddings.append(&mut batch_result);
         }
-
-        let tokenizer = self.tokenizer(loaded).await?;
-        let owned_texts: Vec<String> = texts.iter().map(|t| t.to_string()).collect();
-        let tokens = tokio::task::spawn_blocking(move || -> Result<usize, String> {
-            let encodings = tokenizer
-                .encode_batch(owned_texts, true)
-                .map_err(|e| format!("tokenize: {}", e))?;
-            Ok(encodings.iter().map(|e| e.get_ids().len()).sum())
-        })
-        .await
-        .map_err(|e| format!("Failed to join tokenizer task: {}", e))??;
 
         touch_access(loaded);
 
@@ -1013,6 +1028,12 @@ mod tests {
             EmbeddingClient::compute_sub_batch(64 * 1024, 512, true),
             256
         );
+    }
+
+    #[test]
+    fn first_over_limit_allows_text_at_the_limit() {
+        assert_eq!(first_over_limit(&[10, 64], 64), None);
+        assert_eq!(first_over_limit(&[10, 65, 70], 64), Some((1, 65)));
     }
 
     #[test]

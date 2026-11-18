@@ -1,4 +1,4 @@
-use embedding::{EmbeddingClient, EmbeddingConfig, EmbeddingModel};
+use embedding::{EmbedError, EmbeddingClient, EmbeddingConfig, EmbeddingModel};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -207,17 +207,30 @@ async fn nomic_embeds_text_past_512_tokens() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "downloads the NomicEmbedTextV15 ONNX model on first run"]
-async fn nomic_tokens_stop_at_max_length() {
+async fn nomic_rejects_text_over_max_length() {
     let mut cfg = nomic_config();
     cfg.max_tokens = 64;
     let client = EmbeddingClient::new(cfg).expect("client init");
-    let long = "word ".repeat(20_000);
-    let result = client
-        .embed("nomic", &[long.as_str(), long.as_str()])
+    let long = "word ".repeat(100);
+    let err = client
+        .embed("nomic", &["short", long.as_str()])
         .await
-        .expect("nomic embed should succeed");
+        .expect_err("text over the limit should be rejected");
 
-    assert_eq!(result.tokens, 2 * 64);
+    assert!(matches!(err, EmbedError::TooLong(_)));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "downloads the AllMiniLML6V2 ONNX model on first run"]
+async fn minilm_rejects_text_over_its_context() {
+    let client = EmbeddingClient::new(small_model_config(1)).expect("client init");
+    let long = "word ".repeat(300);
+    let err = client
+        .embed("minilm", &[long.as_str()])
+        .await
+        .expect_err("text over the model context should be rejected");
+
+    assert!(matches!(err, EmbedError::TooLong(_)));
 }
 
 #[tokio::test(flavor = "multi_thread")]
