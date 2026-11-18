@@ -23,6 +23,16 @@ pub fn dimension(model: &EmbeddingModel) -> usize {
     }
 }
 
+/// Longest input, in tokens, the model was trained to embed.
+pub fn context_length(model: &EmbeddingModel) -> usize {
+    match model {
+        EmbeddingModel::NomicEmbedTextV15 | EmbeddingModel::NomicEmbedTextV1 => 8192,
+        EmbeddingModel::EmbeddingGemma300M => 2048,
+        EmbeddingModel::AllMiniLML6V2 => 256,
+        _ => 512,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -45,5 +55,12 @@ mod tests {
         assert_eq!(dimension(&EmbeddingModel::NomicEmbedTextV15), 768);
         assert_eq!(dimension(&EmbeddingModel::BGELargeENV15), 1024);
         assert_eq!(dimension(&EmbeddingModel::EmbeddingGemma300M), 768);
+    }
+    #[test]
+    fn context_length_known_models() {
+        assert_eq!(context_length(&EmbeddingModel::NomicEmbedTextV15), 8192);
+        assert_eq!(context_length(&EmbeddingModel::EmbeddingGemma300M), 2048);
+        assert_eq!(context_length(&EmbeddingModel::BGESmallENV15), 512);
+        assert_eq!(context_length(&EmbeddingModel::AllMiniLML6V2), 256);
     }
 }
