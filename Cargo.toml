@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 axum = "0.8.7"
-fastembed = "5.15.0"
+fastembed = "7.0.0"
 futures = "0.3.32"
 hf-hub = "0.5.0"
 # Pinned to the ort fastembed uses so the CPU provider type matches.
